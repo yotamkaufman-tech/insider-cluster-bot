@@ -1,0 +1,25 @@
+name: Gap Check
+
+on:
+  schedule:
+    # 14:31 UTC = 09:31 AM ET
+    - cron: "31 14 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  gap-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run gap check
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m src.gap_check
