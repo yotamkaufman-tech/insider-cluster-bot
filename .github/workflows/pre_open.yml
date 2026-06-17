@@ -2,26 +2,27 @@ name: Pre-Open Rebalance Brief
 
 on:
   schedule:
-    # 13:00 UTC = ~08:00 AM ET (adjust ±1hr for DST manually if needed)
     - cron: "0 13 * * 1-5"
   workflow_dispatch: {}
 
 jobs:
   pre-open:
     runs-on: ubuntu-latest
-        env:
-      PYTHONPATH: ${{ github.workspace }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4.2.2
+
       - uses: actions/setup-python@v5.6.0
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Run pre-open logic
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONPATH: ${{ github.workspace }}
         run: python -m src.pre_open
