@@ -8,14 +8,13 @@ For each SCHEDULED signal for today:
 from datetime import date
 import yfinance as yf
 
+from .config import GAP_UP_LIMIT
 from .db import fetchall, execute
 from .telegram_alerts import send_message
-from .config import GAP_UP_LIMIT
 from .business_rules import get_prior_close
 
 
 def get_open_price(ticker: str):
-    """Fetch today open price using 1-day 1-minute intraday bar."""
     try:
         hist = yf.Ticker(ticker).history(period="1d", interval="1m")
         if not hist.empty:
@@ -34,6 +33,7 @@ def main():
     )
 
     if not scheduled:
+        send_message(f"📋 Gap check {today}: No scheduled signals today.")
         return
 
     for sig in scheduled:
@@ -51,17 +51,35 @@ def main():
         gap_pct = (open_price - prior_close) / prior_close
 
         if gap_pct > GAP_UP_LIMIT:
-            execute("""
-                UPDATE signals SET status='SKIPPED', rejection_reason=%s WHERE id=%s
-            """, (f"gap up {gap_pct*100:.1f}% at open", sig["id"]))
+            execute(
+                "UPDATE signals SET status='SKIPPED', rejection_reason=%s WHERE id=%s",
+                (f"gap up {gap_pct*100:.1f}% at open", sig["id"])
+            )
             execute(
                 "UPDATE positions SET status='SKIPPED' WHERE ticker=%s AND entry_date=%s AND status='PENDING'",
                 (ticker, today)
             )
             send_message(
-                f"⛔ <b>SKIP — ${ticker}</b>\n"
+                f"⛔ SKIP — ${ticker}\n"
                 f"Gap up {gap_pct*100:.1f}% at open (limit: 3.0%).\n"
                 f"Signal already priced in. Do NOT enter."
             )
         else:
-            execute("UPDATE s
+            execute(
+                "UPDATE signals SET status='CONFIRMED' WHERE id=%s",
+                (sig["id"],)
+            )
+            execute(
+                "UPDATE positions SET status='OPEN' WHERE ticker=%s AND entry_date=%s AND status='PENDING'",
+                (ticker, today)
+            )
+            direction = "down" if gap_pct < 0 else "flat"
+            send_message(
+                f"✅ GO — ${ticker}\n"
+                f"Gap: {gap_pct*100:+.2f}% ({direction}) — within limit.\n"
+                f"Execute entry now per the 8 AM brief."
+            )
+
+
+if __name__ == "__main__":
+    main()
