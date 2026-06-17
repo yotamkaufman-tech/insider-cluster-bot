@@ -10,6 +10,8 @@ on:
 jobs:
   poll:
     runs-on: ubuntu-latest
+        env:
+      PYTHONPATH: ${{ github.workspace }}
     timeout-minutes: 10
     steps:
       - name: Checkout code
