@@ -2,35 +2,27 @@ name: EDGAR Poll
 
 on:
   schedule:
-    # Every 15 minutes Mon-Fri between 11:00–01:00 UTC (= 06:00–20:00 ET, accounting for DST)
-    - cron: "*/15 11-23 * * 1-5"
-    - cron: "*/15 0-1 * * 2-6"
-  workflow_dispatch: {}  # allows manual trigger from GitHub UI
+    - cron: "*/15 10-00 * * 1-5"
+  workflow_dispatch: {}
 
 jobs:
   poll:
     runs-on: ubuntu-latest
-        env:
-      PYTHONPATH: ${{ github.workspace }}
     timeout-minutes: 10
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v4.2.2
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5.6.0
+      - uses: actions/setup-python@v5.6.0
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Run EDGAR poll
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python -m src.edgar_poll
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m src.edgar_poll
