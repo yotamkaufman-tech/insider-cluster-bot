@@ -3,36 +3,39 @@ from typing import Optional
 import yfinance as yf
 
 ROLE_KEYWORDS = {
-    "CEO": ["chief executive", " ceo", "co-ceo", "interim ceo"],
-    "CFO": ["chief financial", " cfo", "svp, cfo", "evp, cfo"],
-    "COO": ["chief operating", " coo", "evp, coo", "svp, coo"],
-    "Chairman": ["chairman", "chair of the board", "exec chair", " cob"],
+    "CEO": [
+        "chief executive",
+        "ceo",
+        "co-ceo",
+        "interim ceo",
+    ],
+    "CFO": [
+        "chief financial",
+        "cfo",
+    ],
+    "COO": [
+        "chief operating",
+        "coo",
+        "chief operations",
+    ],
+    "Chairman": [
+        "chairman",
+        "chair of the board",
+        "exec chair",
+        "executive chair",
+        "cob",
+    ],
 }
 
 
 def classify_role(title):
-    t = title.lower()
+    if not title:
+        return None
+    t = title.lower().strip()
     for role, keywords in ROLE_KEYWORDS.items():
         if any(kw in t for kw in keywords):
             return role
     return None
-
-
-def is_qualifying_role(title):
-    return classify_role(title) is not None
-
-
-def get_prior_close(ticker):
-    try:
-        hist = yf.Ticker(ticker).history(period="5d")
-        if len(hist) >= 2:
-            return float(hist["Close"].iloc[-2])
-        elif len(hist) == 1:
-            return float(hist["Close"].iloc[-1])
-    except Exception:
-        pass
-    return None
-
 
 def get_current_price(ticker):
     try:
