@@ -30,17 +30,34 @@ def fetch_rss_entries():
 
 
 def fetch_filing_xml(index_url):
+    """
+    Given an EDGAR filing index page URL, find the raw Form 4 XML file.
+    Skips xslF345X06 (HTML renderer) and finds the actual data XML.
+    """
     try:
+        # Convert filing page URL to index JSON for reliable parsing
+        # e.g. https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&...
+        # RSS entries link to the filing index page directly
         resp = requests.get(index_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
-        matches = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', resp.text)
-        if not matches:
+
+        # Find all .xml hrefs but EXCLUDE the xslF345X06 stylesheet viewer
+        matches = re.findall(
+            r'href="(/Archives/edgar/data/[^"]+\.xml)"',
+            resp.text
+        )
+        # Filter out the HTML renderer path
+        raw_xml_paths = [m for m in matches if "xslF345X06" not in m and "xslF345X05" not in m]
+
+        if not raw_xml_paths:
             return None, None
-        xml_url = "https://www.sec.gov" + matches[0]
+
+        xml_url = "https://www.sec.gov" + raw_xml_paths[0]
         time.sleep(0.11)
         xml_resp = requests.get(xml_url, headers=HEADERS, timeout=15)
         xml_resp.raise_for_status()
         return xml_url, xml_resp.text
+
     except Exception as e:
         print(f"fetch_filing_xml error: {e}")
         return None, None
@@ -138,10 +155,8 @@ def insert_filing(f, xml_url=None):
 
 def detect_clusters():
     cutoff = date.today() - timedelta(days=CLUSTER_WINDOW_DAYS)
-
     rows = fetchall(
-        "SELECT DISTINCT ticker FROM filings WHERE filing_date >= %s",
-        (cutoff,)
+        "SELECT DISTINCT ticker FROM filings WHERE filing_date >= %s", (cutoff,)
     )
 
     for row in rows:
@@ -149,7 +164,6 @@ def detect_clusters():
 
         if fetchone("SELECT id FROM positions WHERE ticker=%s AND status='OPEN'", (ticker,)):
             continue
-
         if fetchone(
             "SELECT id FROM signals WHERE ticker=%s AND status IN ('PENDING','SCHEDULED','CONFIRMED')",
             (ticker,)
@@ -158,8 +172,7 @@ def detect_clusters():
 
         filings = fetchall("""
             SELECT DISTINCT cik, insider_name, insider_role, filing_date, value
-            FROM filings
-            WHERE ticker=%s AND filing_date >= %s
+            FROM filings WHERE ticker=%s AND filing_date >= %s
             ORDER BY filing_date ASC
         """, (ticker, cutoff))
 
@@ -206,22 +219,24 @@ def detect_clusters():
 
 def main():
     entries = fetch_rss_entries()
+    new_count = 0
+    skipped = 0
 
-    # Grab first entry and print raw XML to see actual tag structure
-    for entry in entries[:3]:
+    for entry in entries:
         index_url = entry.get("link", "")
         if not index_url:
             continue
         xml_url, xml_text = fetch_filing_xml(index_url)
         if not xml_text:
+            skipped += 1
             continue
-        # Print first 2000 chars of XML so we can see the tag names
-        print(f"\n--- XML from {xml_url} ---")
-        print(xml_text[:2000])
-        print("--- END SAMPLE ---\n")
-        break  # only need one sample
+        filings = parse_form4_xml(xml_text)
+        for f in filings:
+            insert_filing(f, xml_url)
+            new_count += 1
 
-    print("Diagnostic complete.")
+    detect_clusters()
+    print(f"edgar_poll done: {len(entries)} entries, {skipped} skipped, {new_count} inserted.")
 
 
 if __name__ == "__main__":
