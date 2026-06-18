@@ -191,4 +191,47 @@ def detect_clusters():
               (ticker, cluster_type,
                insider_1_name, insider_1_role, insider_1_value,
                insider_2_name, insider_2_role, insider_2_value,
-               fi
+               filing_date_1, filing_date_2,
+               detection_time, entry_date, status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'PENDING')
+            ON CONFLICT DO NOTHING
+        """, (
+            ticker, cluster_type,
+            i1["insider_name"], i1["insider_role"], float(i1["value"]),
+            i2["insider_name"], i2["insider_role"], float(i2["value"]),
+            i1["filing_date"], i2["filing_date"],
+            datetime.now(timezone.utc), entry_date,
+        ))
+
+        send_message(
+            f"NEW CLUSTER {ticker} Type {cluster_type}\n"
+            f"Entry: {entry_date}\n"
+            f"{i1['insider_name']} ({i1['insider_role']}) ${float(i1['value']):,.0f}\n"
+            f"{i2['insider_name']} ({i2['insider_role']}) ${float(i2['value']):,.0f}"
+        )
+
+
+def main():
+    entries = fetch_rss_entries()
+    new_count = 0
+    skipped = 0
+
+    for entry in entries:
+        index_url = entry.get("link", "")
+        if not index_url:
+            continue
+        xml_url, xml_text = fetch_filing_xml(index_url)
+        if not xml_text:
+            skipped += 1
+            continue
+        filings = parse_form4_xml(xml_text)
+        for f in filings:
+            insert_filing(f, xml_url)
+            new_count += 1
+
+    detect_clusters()
+    print(f"edgar_poll done: {len(entries)} entries, {skipped} skipped, {new_count} inserted.")
+
+
+if __name__ == "__main__":
+    main()
