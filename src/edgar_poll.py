@@ -208,6 +208,10 @@ def main():
     entries = fetch_rss_entries()
     new_count = 0
     skipped = 0
+    parsed_total = 0
+    role_filtered = 0
+    value_filtered = 0
+    code_filtered = 0
 
     for entry in entries:
         index_url = entry.get("link", "")
@@ -217,13 +221,47 @@ def main():
         if not xml_text:
             skipped += 1
             continue
+
+        try:
+            from lxml import etree
+            root = etree.fromstring(xml_text.encode(), parser=etree.XMLParser(recover=True))
+            for txn in root.findall(".//nonDerivativeTransaction"):
+                parsed_total += 1
+                code_el = txn.find(".//transactionCode")
+                shares_el = txn.find(".//transactionShares/value")
+                price_el = txn.find(".//transactionPricePerShare/value")
+                if code_el is None or code_el.text != "P":
+                    code_filtered += 1
+                    continue
+                if shares_el is None or price_el is None:
+                    continue
+                try:
+                    val = float(shares_el.text) * float(price_el.text)
+                except Exception:
+                    continue
+                if val < MIN_PURCHASE:
+                    value_filtered += 1
+                    continue
+                role_el = root.find(".//officerTitle")
+                role_raw = role_el.text.strip() if role_el is not None and role_el.text else ""
+                if classify_role(role_raw) is None:
+                    role_filtered += 1
+        except Exception:
+            pass
+
         filings = parse_form4_xml(xml_text)
         for f in filings:
             insert_filing(f, xml_url)
             new_count += 1
 
     detect_clusters()
-    print(f"edgar_poll done: {len(entries)} entries, {skipped} skipped, {new_count} inserted.")
+    print(f"RSS entries: {len(entries)}")
+    print(f"XML skipped (fetch fail): {skipped}")
+    print(f"Transactions parsed: {parsed_total}")
+    print(f"Filtered - not code P: {code_filtered}")
+    print(f"Filtered - value < $50k: {value_filtered}")
+    print(f"Filtered - role not C-level: {role_filtered}")
+    print(f"Inserted into DB: {new_count}")
 
 
 if __name__ == "__main__":
