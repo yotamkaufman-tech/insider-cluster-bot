@@ -46,63 +46,58 @@ def accession_from_url(url):
 
 def fetch_filing_xml(index_url):
     """
-    Use EDGAR's JSON index API to find the raw Form 4 XML file.
-    Avoids the xslF345X06 HTML renderer entirely.
+    Fetch the raw Form 4 XML from an EDGAR filing index page.
+    The index page lists all files; we find the .xml that is NOT the xsl renderer.
     """
     try:
-        cik, accession = accession_from_url(index_url)
+        resp = requests.get(index_url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
+        html = resp.text
 
-        # If we couldn't parse from URL, try fetching the index page
-        if not cik or not accession:
-            resp = requests.get(index_url, headers=HEADERS, timeout=15)
-            resp.raise_for_status()
-            cik_m = re.search(r'/data/(\d+)/', resp.url)
-            acc_m = re.search(r'([\d]{10}-[\d]{2}-[\d]{6})', resp.url)
-            if cik_m and acc_m:
-                cik = cik_m.group(1)
-                accession = acc_m.group(1)
-            else:
-                return None, None
+        # Find all href links to .xml files in the Archives path
+        all_xml = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', html)
 
-        # Use the EDGAR JSON index API
-        accession_nodash = accession.replace("-", "")
-        json_url = (
-            f"https://data.sec.gov/submissions/"
-            f"CIK{cik.zfill(10)}.json"
-        )
-        # Faster: use the filing index JSON directly
-        index_json_url = (
-            f"https://www.sec.gov/Archives/edgar/data/{cik}/"
-            f"{accession_nodash}/{accession}-index.json"
-        )
+        # The raw data XML does NOT have 'xslF345' in the path
+        # It typically looks like: /Archives/edgar/data/CIK/ACCESSION/filename.xml
+        raw_xml_list = [x for x in all_xml if "xslF345" not in x]
 
-        time.sleep(0.11)
-        idx_resp = requests.get(index_json_url, headers=HEADERS, timeout=15)
-        idx_resp.raise_for_status()
-        idx_data = idx_resp.json()
-
-        # Find the primary XML document (not the stylesheet renderer)
-        xml_filename = None
-        for item in idx_data.get("directory", {}).get("item", []):
-            name = item.get("name", "")
-            if name.endswith(".xml") and "xsl" not in name.lower():
-                xml_filename = name
-                break
-
-        if not xml_filename:
+        if not raw_xml_list:
+            # fallback: try to build URL from accession in the index URL
+            # index URL pattern: .../ACCESSION-nodash/ACCESSION-index.htm
+            m = re.search(r'/Archives/edgar/data/(\d+)/(\d+)/', index_url)
+            if m:
+                cik = m.group(1)
+                acc_nodash = m.group(2)
+                # Try common Form 4 XML filename patterns
+                for fname in [f"{acc_nodash}.xml", "ownership.xml", "form4.xml"]:
+                    test_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{fname}"
+                    try:
+                        test_resp = requests.get(test_url, headers=HEADERS, timeout=10)
+                        if test_resp.status_code == 200 and "<ownershipDocument" in test_resp.text:
+                            return test_url, test_resp.text
+                    except Exception:
+                        continue
             return None, None
 
-        xml_url = (
-            f"https://www.sec.gov/Archives/edgar/data/{cik}/"
-            f"{accession_nodash}/{xml_filename}"
-        )
+        xml_url = "https://www.sec.gov" + raw_xml_list[0]
         time.sleep(0.11)
         xml_resp = requests.get(xml_url, headers=HEADERS, timeout=15)
         xml_resp.raise_for_status()
+
+        # Verify it's actually Form 4 XML, not HTML
+        if "<ownershipDocument" not in xml_resp.text and "<HTML>" in xml_resp.text.upper():
+            # Got HTML again, try next xml in list
+            for alt in raw_xml_list[1:]:
+                alt_url = "https://www.sec.gov" + alt
+                alt_resp = requests.get(alt_url, headers=HEADERS, timeout=10)
+                if "<ownershipDocument" in alt_resp.text:
+                    return alt_url, alt_resp.text
+            return None, None
+
         return xml_url, xml_resp.text
 
     except Exception as e:
-        print(f"fetch_filing_xml error for {index_url}: {e}")
+        print(f"fetch_filing_xml error: {e}")
         return None, None
 
 
