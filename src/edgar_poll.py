@@ -29,37 +29,80 @@ def fetch_rss_entries():
         return []
 
 
+def accession_from_url(url):
+    """
+    Extract CIK and accession number from any EDGAR URL.
+    Returns (cik, accession_dashes) or (None, None).
+    """
+    m = re.search(r'/Archives/edgar/data/(\d+)/([\d-]+)/', url)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.search(r'accession-number=([\d-]+)', url)
+    cik_m = re.search(r'CIK=(\d+)', url, re.IGNORECASE)
+    if m and cik_m:
+        return cik_m.group(1), m.group(1)
+    return None, None
+
+
 def fetch_filing_xml(index_url):
     """
-    Given an EDGAR filing index page URL, find the raw Form 4 XML file.
-    Skips xslF345X06 (HTML renderer) and finds the actual data XML.
+    Use EDGAR's JSON index API to find the raw Form 4 XML file.
+    Avoids the xslF345X06 HTML renderer entirely.
     """
     try:
-        # Convert filing page URL to index JSON for reliable parsing
-        # e.g. https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&...
-        # RSS entries link to the filing index page directly
-        resp = requests.get(index_url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
+        cik, accession = accession_from_url(index_url)
 
-        # Find all .xml hrefs but EXCLUDE the xslF345X06 stylesheet viewer
-        matches = re.findall(
-            r'href="(/Archives/edgar/data/[^"]+\.xml)"',
-            resp.text
+        # If we couldn't parse from URL, try fetching the index page
+        if not cik or not accession:
+            resp = requests.get(index_url, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            cik_m = re.search(r'/data/(\d+)/', resp.url)
+            acc_m = re.search(r'([\d]{10}-[\d]{2}-[\d]{6})', resp.url)
+            if cik_m and acc_m:
+                cik = cik_m.group(1)
+                accession = acc_m.group(1)
+            else:
+                return None, None
+
+        # Use the EDGAR JSON index API
+        accession_nodash = accession.replace("-", "")
+        json_url = (
+            f"https://data.sec.gov/submissions/"
+            f"CIK{cik.zfill(10)}.json"
         )
-        # Filter out the HTML renderer path
-        raw_xml_paths = [m for m in matches if "xslF345X06" not in m and "xslF345X05" not in m]
+        # Faster: use the filing index JSON directly
+        index_json_url = (
+            f"https://www.sec.gov/Archives/edgar/data/{cik}/"
+            f"{accession_nodash}/{accession}-index.json"
+        )
 
-        if not raw_xml_paths:
+        time.sleep(0.11)
+        idx_resp = requests.get(index_json_url, headers=HEADERS, timeout=15)
+        idx_resp.raise_for_status()
+        idx_data = idx_resp.json()
+
+        # Find the primary XML document (not the stylesheet renderer)
+        xml_filename = None
+        for item in idx_data.get("directory", {}).get("item", []):
+            name = item.get("name", "")
+            if name.endswith(".xml") and "xsl" not in name.lower():
+                xml_filename = name
+                break
+
+        if not xml_filename:
             return None, None
 
-        xml_url = "https://www.sec.gov" + raw_xml_paths[0]
+        xml_url = (
+            f"https://www.sec.gov/Archives/edgar/data/{cik}/"
+            f"{accession_nodash}/{xml_filename}"
+        )
         time.sleep(0.11)
         xml_resp = requests.get(xml_url, headers=HEADERS, timeout=15)
         xml_resp.raise_for_status()
         return xml_url, xml_resp.text
 
     except Exception as e:
-        print(f"fetch_filing_xml error: {e}")
+        print(f"fetch_filing_xml error for {index_url}: {e}")
         return None, None
 
 
@@ -93,7 +136,9 @@ def parse_form4_xml(xml_text):
             except ValueError:
                 pass
 
+        txn_count = 0
         for txn in root.findall(".//nonDerivativeTransaction"):
+            txn_count += 1
             code_el = txn.find(".//transactionCode")
             shares_el = txn.find(".//transactionShares/value")
             price_el = txn.find(".//transactionPricePerShare/value")
@@ -129,6 +174,9 @@ def parse_form4_xml(xml_text):
                 "filed_at": datetime.now(timezone.utc),
                 "is_amendment": is_amendment,
             })
+
+        if txn_count > 0:
+            print(f"  {ticker}: {txn_count} txns, role={role_raw!r}, results={len(results)}")
 
     except Exception as e:
         print(f"parse_form4_xml error: {e}")
