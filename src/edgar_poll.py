@@ -2,8 +2,8 @@ import re
 import time
 import requests
 import feedparser
+from lxml import etree
 from datetime import datetime, timezone, date, timedelta
-from xml.etree import ElementTree as ET
 
 from .config import MIN_PURCHASE, CLUSTER_WINDOW_DAYS
 from .db import fetchall, execute, fetchone
@@ -49,37 +49,30 @@ def fetch_filing_xml(index_url):
 def parse_form4_xml(xml_text):
     results = []
     try:
-        root = ET.fromstring(xml_text)
+        root = etree.fromstring(xml_text.encode(), parser=etree.XMLParser(recover=True))
 
-        ticker_el = root.find(".//issuerTradingSymbol")
-        if ticker_el is None or not ticker_el.text:
+        def find_text(tag):
+            el = root.find(".//" + tag)
+            return el.text.strip() if el is not None and el.text else None
+
+        ticker = find_text("issuerTradingSymbol")
+        if not ticker:
             return []
-        ticker = ticker_el.text.strip().upper()
+        ticker = ticker.upper()
 
-        cik_el = root.find(".//issuerCik")
-        cik = cik_el.text.strip() if cik_el is not None and cik_el.text else None
+        cik = find_text("issuerCik")
+        insider_name = find_text("rptOwnerName") or "Unknown"
+        insider_cik = find_text("rptOwnerCik") or cik
+        role_raw = find_text("officerTitle") or ""
 
-        name_el = root.find(".//rptOwnerName")
-        insider_name = name_el.text.strip() if name_el is not None and name_el.text else "Unknown"
+        doc_type = find_text("documentType") or ""
+        is_amendment = doc_type.endswith("/A")
 
-        insider_cik_el = root.find(".//rptOwnerCik")
-        insider_cik = insider_cik_el.text.strip() if insider_cik_el is not None and insider_cik_el.text else cik
-
-        role_raw = ""
-        title_el = root.find(".//officerTitle")
-        if title_el is not None and title_el.text:
-            role_raw = title_el.text.strip()
-
-        doc_type_el = root.find(".//documentType")
-        is_amendment = False
-        if doc_type_el is not None and doc_type_el.text:
-            is_amendment = doc_type_el.text.strip().endswith("/A")
-
-        period_el = root.find(".//periodOfReport")
+        period = find_text("periodOfReport")
         filing_date = date.today()
-        if period_el is not None and period_el.text:
+        if period:
             try:
-                filing_date = date.fromisoformat(period_el.text.strip())
+                filing_date = date.fromisoformat(period)
             except ValueError:
                 pass
 
@@ -108,7 +101,7 @@ def parse_form4_xml(xml_text):
                 continue
 
             results.append({
-                "cik": insider_cik or cik,
+                "cik": insider_cik,
                 "ticker": ticker,
                 "insider_name": insider_name,
                 "insider_role": role,
@@ -120,8 +113,8 @@ def parse_form4_xml(xml_text):
                 "is_amendment": is_amendment,
             })
 
-    except ET.ParseError as e:
-        print(f"parse_form4_xml XML error: {e}")
+    except Exception as e:
+        print(f"parse_form4_xml error: {e}")
 
     return results
 
