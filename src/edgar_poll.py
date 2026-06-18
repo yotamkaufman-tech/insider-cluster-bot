@@ -14,12 +14,19 @@ EDGAR_RSS = (
     "https://www.sec.gov/cgi-bin/browse-edgar"
     "?action=getcurrent&type=4&owner=include&count=100&output=atom"
 )
-HEADERS = {"User-Agent": "InsiderClusterBot contact@example.com"}
+HEADERS = {"User-Agent": "InsiderClusterBot admin@example.com"}
 
 
 def fetch_rss_entries():
-    feed = feedparser.parse(EDGAR_RSS)
-    return feed.entries
+    try:
+        resp = requests.get(EDGAR_RSS, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.text)
+        print(f"RSS status: {resp.status_code}, entries: {len(feed.entries)}")
+        return feed.entries
+    except Exception as e:
+        print(f"fetch_rss_entries error: {e}")
+        return []
 
 
 def fetch_filing_xml(index_url):
@@ -30,11 +37,12 @@ def fetch_filing_xml(index_url):
         if not matches:
             return None, None
         xml_url = "https://www.sec.gov" + matches[0]
-        time.sleep(0.1)
+        time.sleep(0.11)
         xml_resp = requests.get(xml_url, headers=HEADERS, timeout=15)
         xml_resp.raise_for_status()
         return xml_url, xml_resp.text
-    except Exception:
+    except Exception as e:
+        print(f"fetch_filing_xml error: {e}")
         return None, None
 
 
@@ -112,8 +120,8 @@ def parse_form4_xml(xml_text):
                 "is_amendment": is_amendment,
             })
 
-    except ET.ParseError:
-        pass
+    except ET.ParseError as e:
+        print(f"parse_form4_xml XML error: {e}")
 
     return results
 
@@ -183,45 +191,4 @@ def detect_clusters():
               (ticker, cluster_type,
                insider_1_name, insider_1_role, insider_1_value,
                insider_2_name, insider_2_role, insider_2_value,
-               filing_date_1, filing_date_2,
-               detection_time, entry_date, status)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'PENDING')
-            ON CONFLICT DO NOTHING
-        """, (
-            ticker, cluster_type,
-            i1["insider_name"], i1["insider_role"], float(i1["value"]),
-            i2["insider_name"], i2["insider_role"], float(i2["value"]),
-            i1["filing_date"], i2["filing_date"],
-            datetime.now(timezone.utc), entry_date,
-        ))
-
-        send_message(
-            f"NEW CLUSTER {ticker} Type {cluster_type}\n"
-            f"Entry: {entry_date}\n"
-            f"{i1['insider_name']} ({i1['insider_role']}) ${float(i1['value']):,.0f}\n"
-            f"{i2['insider_name']} ({i2['insider_role']}) ${float(i2['value']):,.0f}"
-        )
-
-
-def main():
-    entries = fetch_rss_entries()
-    new_count = 0
-
-    for entry in entries:
-        index_url = entry.get("link", "")
-        if not index_url:
-            continue
-        xml_url, xml_text = fetch_filing_xml(index_url)
-        if not xml_text:
-            continue
-        filings = parse_form4_xml(xml_text)
-        for f in filings:
-            insert_filing(f, xml_url)
-            new_count += 1
-
-    detect_clusters()
-    print(f"edgar_poll done: {len(entries)} RSS entries, {new_count} filings inserted.")
-
-
-if __name__ == "__main__":
-    main()
+               fi
