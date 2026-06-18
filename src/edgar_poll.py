@@ -131,9 +131,7 @@ def parse_form4_xml(xml_text):
             except ValueError:
                 pass
 
-        txn_count = 0
         for txn in root.findall(".//nonDerivativeTransaction"):
-            txn_count += 1
             code_el = txn.find(".//transactionCode")
             shares_el = txn.find(".//transactionShares/value")
             price_el = txn.find(".//transactionPricePerShare/value")
@@ -170,15 +168,10 @@ def parse_form4_xml(xml_text):
                 "is_amendment": is_amendment,
             })
 
-        if txn_count > 0:
-            codes = [txn.findtext(".//transactionCode") for txn in root.findall(".//nonDerivativeTransaction")]
-            print(f"  {ticker}: {txn_count} txns, codes={codes}, role={role_raw!r}, results={len(results)}")
-
     except Exception as e:
         print(f"parse_form4_xml error: {e}")
 
     return results
-
 def insert_filing(f, xml_url=None):
     try:
         execute("""
