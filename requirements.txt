@@ -3,3 +3,4 @@ feedparser
 psycopg2-binary
 python-dateutil
 yfinance
+lxml
