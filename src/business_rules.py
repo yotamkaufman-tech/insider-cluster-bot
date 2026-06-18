@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+import yfinance as yf
 
 MIN_PURCHASE = 50_000
 CLUSTER_WINDOW_DAYS = 14
@@ -51,3 +52,57 @@ def is_trading_day(d=None):
     if d is None:
         d = date.today()
     return d.weekday() < 5
+
+
+def get_current_price(ticker):
+    try:
+        hist = yf.Ticker(ticker).history(period="2d")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
+
+
+def get_market_cap(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        return info.get("marketCap", None)
+    except Exception:
+        return None
+
+
+def get_adv(ticker):
+    """Average daily volume in shares over last 20 days."""
+    try:
+        hist = yf.Ticker(ticker).history(period="20d")
+        if not hist.empty:
+            return float(hist["Volume"].mean())
+    except Exception:
+        pass
+    return None
+
+
+def has_upcoming_earnings(ticker, days=5):
+    """Best-effort check using yfinance calendar."""
+    try:
+        cal = yf.Ticker(ticker).calendar
+        if cal is None:
+            return False
+        if hasattr(cal, "empty") and cal.empty:
+            return False
+        earnings_date = None
+        if isinstance(cal, dict):
+            earnings_date = cal.get("Earnings Date", [None])[0]
+        else:
+            if "Earnings Date" in cal.columns:
+                earnings_date = cal["Earnings Date"].iloc[0]
+        if earnings_date is None:
+            return False
+        from datetime import datetime
+        if hasattr(earnings_date, "date"):
+            earnings_date = earnings_date.date()
+        today = date.today()
+        return today <= earnings_date <= today + timedelta(days=days)
+    except Exception:
+        return False
