@@ -64,6 +64,22 @@ def get_current_price(ticker):
     return None
 
 
+def get_prior_close(ticker):
+    """
+    Return yesterday's close price for gap checks.
+    Uses last 2 daily bars; falls back to most recent close if only one.
+    """
+    try:
+        hist = yf.Ticker(ticker).history(period="3d")
+        if hist.shape[0] >= 2:
+            return float(hist["Close"].iloc[-2])
+        elif hist.shape[0] == 1:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
+
+
 def get_market_cap(ticker):
     try:
         info = yf.Ticker(ticker).info
@@ -99,7 +115,6 @@ def has_upcoming_earnings(ticker, days=5):
                 earnings_date = cal["Earnings Date"].iloc[0]
         if earnings_date is None:
             return False
-        from datetime import datetime
         if hasattr(earnings_date, "date"):
             earnings_date = earnings_date.date()
         today = date.today()
