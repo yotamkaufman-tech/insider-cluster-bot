@@ -8,25 +8,19 @@ HOLD_DAYS = 5
 
 ROLE_KEYWORDS = {
     "CEO": [
-        "chief executive",
-        "ceo",
-        "co-ceo",
-        "interim ceo",
+        "chief executive", "ceo", "co-ceo", "interim ceo", "pres", "president & ceo",
+        "president and ceo", "principal executive",
     ],
     "CFO": [
-        "chief financial",
-        "cfo",
+        "chief financial", "cfo", "principal financial", "principal accounting",
+        "chief accounting",
     ],
     "COO": [
-        "chief operating",
-        "chief operations",
-        "coo",
+        "chief operating", "chief operations", "coo",
     ],
     "Chairman": [
-        "chairman",
-        "chair of the board",
-        "executive chair",
-        "exec chair",
+        "chairman", "chair of the board", "executive chair", "exec chair",
+        "executive chairman",
     ],
 }
 
