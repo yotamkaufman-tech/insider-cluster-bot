@@ -22,16 +22,12 @@ def fetch_rss_entries():
         resp = requests.get(EDGAR_RSS, headers=HEADERS, timeout=20)
         resp.raise_for_status()
         feed = feedparser.parse(resp.text)
-        # Keep only actual Form 4 entries (title starts with "4 -")
+        # Keep only actual Form 4 / Form 4A entries — filter by tag term
         form4_entries = [
             e for e in feed.entries
-            if e.get("title", "").startswith("4 -")
-            or any(
-                t.get("term", "") == "4"
-                for t in e.get("tags", [])
-            )
+            if any(t.get("term", "") in ("4", "4/A") for t in e.get("tags", []))
         ]
-        print(f"RSS status: {resp.status_code}, entries: {len(feed.entries)}, form4: {len(form4_entries)}")
+        print(f"RSS status: {resp.status_code}, total: {len(feed.entries)}, form4: {len(form4_entries)}")
         return form4_entries
     except Exception as e:
         print(f"fetch_rss_entries error: {e}")
@@ -40,48 +36,51 @@ def fetch_rss_entries():
 
 def fetch_filing_xml(index_url):
     """
-    Derive the XML URL directly from the accession number in the index URL.
-    EDGAR Form 4 XML is always at:
-      /Archives/edgar/data/CIK/ACC_NODASH/ACC_DASHED.xml
-    Falls back to scraping the index page if the direct URL fails.
+    Scrape the EDGAR index page and extract the raw Form 4 XML URL.
+    The index page lists all files; we take the .xml that is NOT the XSL renderer.
+    Key insight: the folder path may use scientific notation (e.g. 1.7293662600001e+14)
+    so we NEVER construct the URL manually — we always read it from the index page.
     """
     try:
-        # Parse: /Archives/edgar/data/CIK/ACC_NODASH/ACC_DASHED-index.htm
-        m = re.search(
-            r'/Archives/edgar/data/(\d+)/(\d+)/([0-9-]+)-index\.htm',
-            index_url
+        time.sleep(0.12)  # Respect SEC rate limit: max ~10 req/sec
+        resp = requests.get(index_url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+
+        # Match both single and double quoted hrefs containing .xml in Archives path
+        # Covers: href="/Archives/..." and href='/Archives/...'
+        all_xml = re.findall(
+            r'href=["\'](/Archives/edgar/data/[^"\']+\.xml)["\']',
+            html,
+            re.IGNORECASE
         )
-        if not m:
+
+        # Exclude the XSL renderer (visual HTML wrapper) — keep only raw data XML
+        raw_xml_list = [x for x in all_xml if "xslF345" not in x and "xsl" not in x.lower()]
+
+        if not raw_xml_list:
+            # Log what XML links were found (including xsl ones) for debugging
+            if all_xml:
+                print(f"fetch_filing_xml: only XSL XML found at {index_url}: {all_xml}")
+            else:
+                print(f"fetch_filing_xml: no .xml hrefs at all for {index_url}")
             return None, None
 
-        cik       = m.group(1)
-        acc_nodash = m.group(2)   # e.g. 000172936626000010
-        acc_dashed = m.group(3)   # e.g. 0001729366-26-000010
-
-        # Primary: ACC_DASHED.xml
-        xml_url = (
-            f"https://www.sec.gov/Archives/edgar/data/{cik}"
-            f"/{acc_nodash}/{acc_dashed}.xml"
-        )
-        time.sleep(0.11)
-        resp = requests.get(xml_url, headers=HEADERS, timeout=15)
-        if resp.status_code == 200 and "<ownershipDocument" in resp.text:
-            return xml_url, resp.text
-
-        # Fallback: scrape index page for any ownershipDocument XML
-        idx_resp = requests.get(index_url, headers=HEADERS, timeout=15)
-        idx_resp.raise_for_status()
-        # EDGAR index pages list files in a table; grab all hrefs with .xml
-        all_xml = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx_resp.text)
-        raw_xml_list = [x for x in all_xml if "xslF345" not in x]
-
+        # Fetch the first raw XML candidate
         for xml_path in raw_xml_list:
-            candidate = "https://www.sec.gov" + xml_path
-            time.sleep(0.11)
-            xml_resp = requests.get(candidate, headers=HEADERS, timeout=15)
-            if xml_resp.status_code == 200 and "<ownershipDocument" in xml_resp.text:
-                return candidate, xml_resp.text
+            xml_url = "https://www.sec.gov" + xml_path
+            time.sleep(0.12)
+            try:
+                xml_resp = requests.get(xml_url, headers=HEADERS, timeout=20)
+                xml_resp.raise_for_status()
+                if "<ownershipDocument" in xml_resp.text:
+                    return xml_url, xml_resp.text
+                # Got XML but not ownershipDocument — could be a different form type
+            except Exception as e:
+                print(f"fetch_filing_xml: error fetching {xml_url}: {e}")
+                continue
 
+        print(f"fetch_filing_xml: no ownershipDocument in any XML for {index_url}")
         return None, None
 
     except Exception as e:
@@ -120,7 +119,7 @@ def parse_form4_xml(xml_text):
                 pass
 
         for txn in root.findall(".//nonDerivativeTransaction"):
-            code_el  = txn.find(".//transactionCode")
+            code_el   = txn.find(".//transactionCode")
             shares_el = txn.find(".//transactionShares/value")
             price_el  = txn.find(".//transactionPricePerShare/value")
 
@@ -175,6 +174,13 @@ def build_seen_keys():
 
 
 def insert_filing(f, xml_url=None):
+    """
+    Returns True if inserted, False if duplicate or error.
+    Conflict key: (cik, ticker, filing_date, shares) — avoids float drift on value.
+    Requires DB unique constraint:
+      ALTER TABLE filings ADD CONSTRAINT filings_unique_filing
+        UNIQUE (cik, ticker, filing_date, shares);
+    """
     try:
         execute("""
             INSERT INTO filings
@@ -250,7 +256,7 @@ def detect_clusters():
         ))
 
         send_message(
-            f"NEW CLUSTER {ticker} Type {cluster_type}\n"
+            f"🔔 NEW CLUSTER {ticker} Type {cluster_type}\n"
             f"Entry: {entry_date}\n"
             f"{i1['insider_name']} ({i1['insider_role']}) ${float(i1['value']):,.0f}\n"
             f"{i2['insider_name']} ({i2['insider_role']}) ${float(i2['value']):,.0f}"
@@ -258,10 +264,11 @@ def detect_clusters():
 
 
 def main():
-    entries  = fetch_rss_entries()
-    skipped  = 0
-    inserted = 0
+    entries    = fetch_rss_entries()
+    skipped    = 0
+    inserted   = 0
     duplicates = 0
+    no_xml     = 0
 
     seen_keys = build_seen_keys()
 
@@ -273,10 +280,14 @@ def main():
 
         xml_url, xml_text = fetch_filing_xml(index_url)
         if not xml_text:
-            skipped += 1
+            no_xml += 1
             continue
 
         filings = parse_form4_xml(xml_text)
+        if not filings:
+            skipped += 1  # Form 4 with no qualifying P transactions
+            continue
+
         for f in filings:
             key = (f["cik"], f["ticker"], str(f["filing_date"]), float(f["shares"]))
             if key in seen_keys:
@@ -290,10 +301,9 @@ def main():
 
     detect_clusters()
     print(
-        f"edgar_poll done: {len(entries)} entries, "
-        f"{skipped} skipped (no XML), "
-        f"{duplicates} duplicates, "
-        f"{inserted} inserted."
+        f"edgar_poll done: {len(entries)} form4 entries, "
+        f"{no_xml} no-XML, {skipped} skipped, "
+        f"{duplicates} duplicates, {inserted} inserted."
     )
 
 
