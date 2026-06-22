@@ -49,6 +49,16 @@ def fetch_filing_xml(index_url):
         all_xml = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', html)
         raw_xml_list = [x for x in all_xml if "xslF345" not in x]
 
+        # --- DIAGNOSTIC: print first failure ---
+        if not raw_xml_list:
+            print(f"NO XML FOUND for: {index_url}")
+            # Print all href links found on the page
+            all_hrefs = re.findall(r'href="([^"]+)"', html)
+            xml_hrefs = [h for h in all_hrefs if ".xml" in h.lower()]
+            print(f"  All XML hrefs on page: {xml_hrefs[:5]}")
+            print(f"  Page snippet: {html[:500]}")
+        # --- END DIAGNOSTIC ---
+
         if not raw_xml_list:
             m = re.search(r'/Archives/edgar/data/(\d+)/(\d+)/', index_url)
             if m:
@@ -80,7 +90,7 @@ def fetch_filing_xml(index_url):
         return xml_url, xml_resp.text
 
     except Exception as e:
-        print(f"fetch_filing_xml error: {e}")
+        print(f"fetch_filing_xml error ({index_url}): {e}")
         return None, None
 
 
