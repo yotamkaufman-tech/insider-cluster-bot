@@ -22,46 +22,43 @@ def fetch_rss_entries():
         resp = requests.get(EDGAR_RSS, headers=HEADERS, timeout=20)
         resp.raise_for_status()
         feed = feedparser.parse(resp.text)
-        print(f"RSS status: {resp.status_code}, entries: {len(feed.entries)}")
-        return feed.entries
+        # Keep only actual Form 4 entries (title starts with "4 -")
+        form4_entries = [
+            e for e in feed.entries
+            if e.get("title", "").startswith("4 -")
+            or any(
+                t.get("term", "") == "4"
+                for t in e.get("tags", [])
+            )
+        ]
+        print(f"RSS status: {resp.status_code}, entries: {len(feed.entries)}, form4: {len(form4_entries)}")
+        return form4_entries
     except Exception as e:
         print(f"fetch_rss_entries error: {e}")
         return []
 
 
-def accession_from_url(url):
-    m = re.search(r'/Archives/edgar/data/(\d+)/([\d-]+)/', url)
-    if m:
-        return m.group(1), m.group(2)
-    m = re.search(r'accession-number=([\d-]+)', url)
-    cik_m = re.search(r'CIK=(\d+)', url, re.IGNORECASE)
-    if m and cik_m:
-        return cik_m.group(1), m.group(1)
-    return None, None
-
-
 def fetch_filing_xml(index_url):
     """
-    Build the XML URL directly from the accession number in the index URL.
-    Pattern: /Archives/edgar/data/CIK/ACCESSION-dashes/ACCESSION-dashes-index.htm
-    Raw XML lives at: /Archives/edgar/data/CIK/ACCESSION-nodash/ACCESSION-nodash.xml
+    Derive the XML URL directly from the accession number in the index URL.
+    EDGAR Form 4 XML is always at:
+      /Archives/edgar/data/CIK/ACC_NODASH/ACC_DASHED.xml
+    Falls back to scraping the index page if the direct URL fails.
     """
     try:
-        # Extract CIK and dashed accession from index URL
-        # e.g. /Archives/edgar/data/1729366/000172936626000010/0001729366-26-000010-index.htm
+        # Parse: /Archives/edgar/data/CIK/ACC_NODASH/ACC_DASHED-index.htm
         m = re.search(
-            r'/Archives/edgar/data/(\d+)/([\d]+)/([0-9-]+)-index\.htm',
+            r'/Archives/edgar/data/(\d+)/(\d+)/([0-9-]+)-index\.htm',
             index_url
         )
         if not m:
-            print(f"fetch_filing_xml: can't parse index URL: {index_url}")
             return None, None
 
-        cik = m.group(1)
-        acc_nodash = m.group(2)          # e.g. 000172936626000010
-        acc_dashed = m.group(3)          # e.g. 0001729366-26-000010
+        cik       = m.group(1)
+        acc_nodash = m.group(2)   # e.g. 000172936626000010
+        acc_dashed = m.group(3)   # e.g. 0001729366-26-000010
 
-        # Primary attempt: accession-nodash.xml (most common Form 4 filename)
+        # Primary: ACC_DASHED.xml
         xml_url = (
             f"https://www.sec.gov/Archives/edgar/data/{cik}"
             f"/{acc_nodash}/{acc_dashed}.xml"
@@ -71,9 +68,10 @@ def fetch_filing_xml(index_url):
         if resp.status_code == 200 and "<ownershipDocument" in resp.text:
             return xml_url, resp.text
 
-        # Fallback: scrape the index page for any .xml that isn't the XSL renderer
+        # Fallback: scrape index page for any ownershipDocument XML
         idx_resp = requests.get(index_url, headers=HEADERS, timeout=15)
         idx_resp.raise_for_status()
+        # EDGAR index pages list files in a table; grab all hrefs with .xml
         all_xml = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx_resp.text)
         raw_xml_list = [x for x in all_xml if "xslF345" not in x]
 
@@ -84,12 +82,12 @@ def fetch_filing_xml(index_url):
             if xml_resp.status_code == 200 and "<ownershipDocument" in xml_resp.text:
                 return candidate, xml_resp.text
 
-        print(f"fetch_filing_xml: no ownershipDocument XML found for {index_url}")
         return None, None
 
     except Exception as e:
         print(f"fetch_filing_xml error ({index_url}): {e}")
         return None, None
+
 
 def parse_form4_xml(xml_text):
     results = []
@@ -122,9 +120,9 @@ def parse_form4_xml(xml_text):
                 pass
 
         for txn in root.findall(".//nonDerivativeTransaction"):
-            code_el = txn.find(".//transactionCode")
+            code_el  = txn.find(".//transactionCode")
             shares_el = txn.find(".//transactionShares/value")
-            price_el = txn.find(".//transactionPricePerShare/value")
+            price_el  = txn.find(".//transactionPricePerShare/value")
 
             if code_el is None or code_el.text != "P":
                 continue
@@ -133,7 +131,7 @@ def parse_form4_xml(xml_text):
 
             try:
                 shares = float(shares_el.text)
-                price = float(price_el.text)
+                price  = float(price_el.text)
             except (ValueError, TypeError):
                 continue
 
@@ -146,15 +144,15 @@ def parse_form4_xml(xml_text):
                 continue
 
             results.append({
-                "cik": insider_cik,
-                "ticker": ticker,
+                "cik":          insider_cik,
+                "ticker":       ticker,
                 "insider_name": insider_name,
                 "insider_role": role,
-                "shares": shares,
-                "price": price,
-                "value": value,
-                "filing_date": filing_date,
-                "filed_at": datetime.now(timezone.utc),
+                "shares":       shares,
+                "price":        price,
+                "value":        value,
+                "filing_date":  filing_date,
+                "filed_at":     datetime.now(timezone.utc),
                 "is_amendment": is_amendment,
             })
 
@@ -165,7 +163,6 @@ def parse_form4_xml(xml_text):
 
 
 def build_seen_keys():
-    """Pre-load all existing (cik, ticker, filing_date, shares) from DB to skip duplicates."""
     try:
         rows = fetchall("SELECT cik, ticker, filing_date, shares FROM filings")
         return {
@@ -178,14 +175,6 @@ def build_seen_keys():
 
 
 def insert_filing(f, xml_url=None):
-    """
-    Insert a filing row. Returns True on success, False on duplicate or error.
-    Conflict key: (cik, ticker, filing_date, shares) — avoids float drift from value.
-    NOTE: Your DB unique constraint must match this key. Run this migration if needed:
-      ALTER TABLE filings DROP CONSTRAINT IF EXISTS filings_cik_ticker_filing_date_value_key;
-      ALTER TABLE filings ADD CONSTRAINT filings_unique_filing
-        UNIQUE (cik, ticker, filing_date, shares);
-    """
     try:
         execute("""
             INSERT INTO filings
@@ -241,7 +230,7 @@ def detect_clusters():
         i2 = unique_insiders[1]
 
         cluster_type = "A" if i1["filing_date"] == i2["filing_date"] else "B"
-        entry_date = next_trading_day(i2["filing_date"])
+        entry_date   = next_trading_day(i2["filing_date"])
 
         execute("""
             INSERT INTO signals
@@ -269,8 +258,8 @@ def detect_clusters():
 
 
 def main():
-    entries = fetch_rss_entries()
-    skipped = 0
+    entries  = fetch_rss_entries()
+    skipped  = 0
     inserted = 0
     duplicates = 0
 
