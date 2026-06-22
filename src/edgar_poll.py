@@ -41,58 +41,55 @@ def accession_from_url(url):
 
 
 def fetch_filing_xml(index_url):
+    """
+    Build the XML URL directly from the accession number in the index URL.
+    Pattern: /Archives/edgar/data/CIK/ACCESSION-dashes/ACCESSION-dashes-index.htm
+    Raw XML lives at: /Archives/edgar/data/CIK/ACCESSION-nodash/ACCESSION-nodash.xml
+    """
     try:
-        resp = requests.get(index_url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        html = resp.text
+        # Extract CIK and dashed accession from index URL
+        # e.g. /Archives/edgar/data/1729366/000172936626000010/0001729366-26-000010-index.htm
+        m = re.search(
+            r'/Archives/edgar/data/(\d+)/([\d]+)/([0-9-]+)-index\.htm',
+            index_url
+        )
+        if not m:
+            print(f"fetch_filing_xml: can't parse index URL: {index_url}")
+            return None, None
 
-        all_xml = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', html)
+        cik = m.group(1)
+        acc_nodash = m.group(2)          # e.g. 000172936626000010
+        acc_dashed = m.group(3)          # e.g. 0001729366-26-000010
+
+        # Primary attempt: accession-nodash.xml (most common Form 4 filename)
+        xml_url = (
+            f"https://www.sec.gov/Archives/edgar/data/{cik}"
+            f"/{acc_nodash}/{acc_dashed}.xml"
+        )
+        time.sleep(0.11)
+        resp = requests.get(xml_url, headers=HEADERS, timeout=15)
+        if resp.status_code == 200 and "<ownershipDocument" in resp.text:
+            return xml_url, resp.text
+
+        # Fallback: scrape the index page for any .xml that isn't the XSL renderer
+        idx_resp = requests.get(index_url, headers=HEADERS, timeout=15)
+        idx_resp.raise_for_status()
+        all_xml = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx_resp.text)
         raw_xml_list = [x for x in all_xml if "xslF345" not in x]
 
-        # --- DIAGNOSTIC: print first failure ---
-        if not raw_xml_list:
-            print(f"NO XML FOUND for: {index_url}")
-            # Print all href links found on the page
-            all_hrefs = re.findall(r'href="([^"]+)"', html)
-            xml_hrefs = [h for h in all_hrefs if ".xml" in h.lower()]
-            print(f"  All XML hrefs on page: {xml_hrefs[:5]}")
-            print(f"  Page snippet: {html[:500]}")
-        # --- END DIAGNOSTIC ---
+        for xml_path in raw_xml_list:
+            candidate = "https://www.sec.gov" + xml_path
+            time.sleep(0.11)
+            xml_resp = requests.get(candidate, headers=HEADERS, timeout=15)
+            if xml_resp.status_code == 200 and "<ownershipDocument" in xml_resp.text:
+                return candidate, xml_resp.text
 
-        if not raw_xml_list:
-            m = re.search(r'/Archives/edgar/data/(\d+)/(\d+)/', index_url)
-            if m:
-                cik = m.group(1)
-                acc_nodash = m.group(2)
-                for fname in [f"{acc_nodash}.xml", "ownership.xml", "form4.xml"]:
-                    test_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{fname}"
-                    try:
-                        test_resp = requests.get(test_url, headers=HEADERS, timeout=10)
-                        if test_resp.status_code == 200 and "<ownershipDocument" in test_resp.text:
-                            return test_url, test_resp.text
-                    except Exception:
-                        continue
-            return None, None
-
-        xml_url = "https://www.sec.gov" + raw_xml_list[0]
-        time.sleep(0.11)
-        xml_resp = requests.get(xml_url, headers=HEADERS, timeout=15)
-        xml_resp.raise_for_status()
-
-        if "<ownershipDocument" not in xml_resp.text and "<HTML>" in xml_resp.text.upper():
-            for alt in raw_xml_list[1:]:
-                alt_url = "https://www.sec.gov" + alt
-                alt_resp = requests.get(alt_url, headers=HEADERS, timeout=10)
-                if "<ownershipDocument" in alt_resp.text:
-                    return alt_url, alt_resp.text
-            return None, None
-
-        return xml_url, xml_resp.text
+        print(f"fetch_filing_xml: no ownershipDocument XML found for {index_url}")
+        return None, None
 
     except Exception as e:
         print(f"fetch_filing_xml error ({index_url}): {e}")
         return None, None
-
 
 def parse_form4_xml(xml_text):
     results = []
