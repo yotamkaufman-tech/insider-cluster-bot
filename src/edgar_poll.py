@@ -140,10 +140,12 @@ def parse_form4_xml(xml_text):
             return []
         ticker = ticker.upper()
 
-        cik         = find_text("issuerCik")
+        cik          = find_text("issuerCik")
         insider_name = find_text("rptOwnerName") or "Unknown"
         insider_cik  = find_text("rptOwnerCik") or cik
-        role_raw     = find_text("officerTitle") or ""
+
+        # Try officerTitle first, then otherText as fallback
+        role_raw = find_text("officerTitle") or find_text("otherText") or ""
 
         doc_type     = find_text("documentType") or ""
         is_amendment = doc_type.endswith("/A")
