@@ -1,4 +1,3 @@
-$ cat << 'EOF' > /tmp/edgar_poll.py
 import re
 import time
 import requests
@@ -39,19 +38,6 @@ def accession_from_url(url):
     if m and cik_m:
         return cik_m.group(1), m.group(1)
     return None, None
-
-
-def extract_accession_number(index_url):
-    """Extract a clean accession number string from an EDGAR index URL."""
-    # Pattern: /Archives/edgar/data/CIK/0001234567890-12-345678/
-    m = re.search(r'/Archives/edgar/data/\d+/([\d-]+)', index_url)
-    if m:
-        return m.group(1)
-    # Pattern: accession-number=0001234567890-12-345678
-    m = re.search(r'accession-number=([\d-]+)', index_url)
-    if m:
-        return m.group(1)
-    return None
 
 
 def fetch_filing_xml(index_url):
@@ -98,7 +84,7 @@ def fetch_filing_xml(index_url):
         return None, None
 
 
-def parse_form4_xml(xml_text, accession_number=None):
+def parse_form4_xml(xml_text):
     results = []
     try:
         root = etree.fromstring(xml_text.encode(), parser=etree.XMLParser(recover=True))
@@ -163,7 +149,6 @@ def parse_form4_xml(xml_text, accession_number=None):
                 "filing_date": filing_date,
                 "filed_at": datetime.now(timezone.utc),
                 "is_amendment": is_amendment,
-                "accession_number": accession_number,
             })
 
     except Exception as e:
@@ -172,52 +157,43 @@ def parse_form4_xml(xml_text, accession_number=None):
     return results
 
 
-def get_existing_accessions():
-    """Fetch all accession numbers already in the DB from the last 30 days."""
-    cutoff = date.today() - timedelta(days=30)
+def build_seen_keys():
+    """Pre-load all existing (cik, ticker, filing_date, shares) from DB to skip duplicates."""
     try:
-        rows = fetchall(
-            "SELECT accession_number FROM filings WHERE filing_date >= %s AND accession_number IS NOT NULL",
-            (cutoff,)
-        )
-        return {row["accession_number"] for row in rows}
+        rows = fetchall("SELECT cik, ticker, filing_date, shares FROM filings")
+        return {
+            (r["cik"], r["ticker"], str(r["filing_date"]), float(r["shares"]))
+            for r in rows
+        }
     except Exception as e:
-        print(f"get_existing_accessions error: {e}")
+        print(f"build_seen_keys error: {e}")
         return set()
 
 
 def insert_filing(f, xml_url=None):
     """
-    Insert a filing row. Returns True if a new row was inserted, False if it was a duplicate.
-    Conflict key: accession_number (unique per SEC filing).
-    Falls back to (cik, ticker, filing_date, shares) if accession_number is NULL.
+    Insert a filing row. Returns True on success, False on duplicate or error.
+    Conflict key: (cik, ticker, filing_date, shares) — avoids float drift from value.
+    NOTE: Your DB unique constraint must match this key. Run this migration if needed:
+      ALTER TABLE filings DROP CONSTRAINT IF EXISTS filings_cik_ticker_filing_date_value_key;
+      ALTER TABLE filings ADD CONSTRAINT filings_unique_filing
+        UNIQUE (cik, ticker, filing_date, shares);
     """
     try:
-        # Check if accession_number already exists before inserting
-        if f.get("accession_number"):
-            existing = fetchone(
-                "SELECT id FROM filings WHERE accession_number = %s",
-                (f["accession_number"],)
-            )
-            if existing:
-                return False  # true duplicate
-
         execute("""
             INSERT INTO filings
               (cik, ticker, insider_name, insider_role, transaction_code,
-               shares, price, value, filing_date, filed_at, is_amendment,
-               raw_xml_url, accession_number)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               shares, price, value, filing_date, filed_at, is_amendment, raw_xml_url)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (cik, ticker, filing_date, shares) DO NOTHING
         """, (
             f["cik"], f["ticker"], f["insider_name"], f["insider_role"], "P",
             f["shares"], f["price"], f["value"],
-            f["filing_date"], f["filed_at"], f["is_amendment"],
-            xml_url, f.get("accession_number"),
+            f["filing_date"], f["filed_at"], f["is_amendment"], xml_url,
         ))
         return True
     except Exception as e:
-        print(f"insert_filing error: {e} | accession: {f.get('accession_number')}")
+        print(f"insert_filing error: {e}")
         return False
 
 
@@ -287,13 +263,11 @@ def detect_clusters():
 
 def main():
     entries = fetch_rss_entries()
-    inserted = 0
     skipped = 0
+    inserted = 0
     duplicates = 0
 
-    # Pre-fetch known accessions to avoid redundant XML fetches
-    existing_accessions = get_existing_accessions()
-    print(f"Known accessions in DB (last 30d): {len(existing_accessions)}")
+    seen_keys = build_seen_keys()
 
     for entry in entries:
         index_url = entry.get("link", "")
@@ -301,22 +275,19 @@ def main():
             skipped += 1
             continue
 
-        accession = extract_accession_number(index_url)
-
-        # Skip XML fetch entirely if we already have this filing
-        if accession and accession in existing_accessions:
-            duplicates += 1
-            continue
-
         xml_url, xml_text = fetch_filing_xml(index_url)
         if not xml_text:
             skipped += 1
             continue
 
-        filings = parse_form4_xml(xml_text, accession_number=accession)
+        filings = parse_form4_xml(xml_text)
         for f in filings:
-            was_inserted = insert_filing(f, xml_url)
-            if was_inserted:
+            key = (f["cik"], f["ticker"], str(f["filing_date"]), float(f["shares"]))
+            if key in seen_keys:
+                duplicates += 1
+                continue
+            if insert_filing(f, xml_url):
+                seen_keys.add(key)
                 inserted += 1
             else:
                 duplicates += 1
@@ -332,5 +303,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
-echo "Done"
