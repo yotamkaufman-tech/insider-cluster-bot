@@ -1,3 +1,4 @@
+$ cat << 'EOF' > /tmp/edgar_poll.py
 import re
 import time
 import requests
@@ -30,10 +31,6 @@ def fetch_rss_entries():
 
 
 def accession_from_url(url):
-    """
-    Extract CIK and accession number from any EDGAR URL.
-    Returns (cik, accession_dashes) or (None, None).
-    """
     m = re.search(r'/Archives/edgar/data/(\d+)/([\d-]+)/', url)
     if m:
         return m.group(1), m.group(2)
@@ -44,31 +41,33 @@ def accession_from_url(url):
     return None, None
 
 
+def extract_accession_number(index_url):
+    """Extract a clean accession number string from an EDGAR index URL."""
+    # Pattern: /Archives/edgar/data/CIK/0001234567890-12-345678/
+    m = re.search(r'/Archives/edgar/data/\d+/([\d-]+)', index_url)
+    if m:
+        return m.group(1)
+    # Pattern: accession-number=0001234567890-12-345678
+    m = re.search(r'accession-number=([\d-]+)', index_url)
+    if m:
+        return m.group(1)
+    return None
+
+
 def fetch_filing_xml(index_url):
-    """
-    Fetch the raw Form 4 XML from an EDGAR filing index page.
-    The index page lists all files; we find the .xml that is NOT the xsl renderer.
-    """
     try:
         resp = requests.get(index_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         html = resp.text
 
-        # Find all href links to .xml files in the Archives path
         all_xml = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', html)
-
-        # The raw data XML does NOT have 'xslF345' in the path
-        # It typically looks like: /Archives/edgar/data/CIK/ACCESSION/filename.xml
         raw_xml_list = [x for x in all_xml if "xslF345" not in x]
 
         if not raw_xml_list:
-            # fallback: try to build URL from accession in the index URL
-            # index URL pattern: .../ACCESSION-nodash/ACCESSION-index.htm
             m = re.search(r'/Archives/edgar/data/(\d+)/(\d+)/', index_url)
             if m:
                 cik = m.group(1)
                 acc_nodash = m.group(2)
-                # Try common Form 4 XML filename patterns
                 for fname in [f"{acc_nodash}.xml", "ownership.xml", "form4.xml"]:
                     test_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{fname}"
                     try:
@@ -84,9 +83,7 @@ def fetch_filing_xml(index_url):
         xml_resp = requests.get(xml_url, headers=HEADERS, timeout=15)
         xml_resp.raise_for_status()
 
-        # Verify it's actually Form 4 XML, not HTML
         if "<ownershipDocument" not in xml_resp.text and "<HTML>" in xml_resp.text.upper():
-            # Got HTML again, try next xml in list
             for alt in raw_xml_list[1:]:
                 alt_url = "https://www.sec.gov" + alt
                 alt_resp = requests.get(alt_url, headers=HEADERS, timeout=10)
@@ -101,7 +98,7 @@ def fetch_filing_xml(index_url):
         return None, None
 
 
-def parse_form4_xml(xml_text):
+def parse_form4_xml(xml_text, accession_number=None):
     results = []
     try:
         root = etree.fromstring(xml_text.encode(), parser=etree.XMLParser(recover=True))
@@ -166,27 +163,62 @@ def parse_form4_xml(xml_text):
                 "filing_date": filing_date,
                 "filed_at": datetime.now(timezone.utc),
                 "is_amendment": is_amendment,
+                "accession_number": accession_number,
             })
 
     except Exception as e:
         print(f"parse_form4_xml error: {e}")
 
     return results
-def insert_filing(f, xml_url=None):
+
+
+def get_existing_accessions():
+    """Fetch all accession numbers already in the DB from the last 30 days."""
+    cutoff = date.today() - timedelta(days=30)
     try:
+        rows = fetchall(
+            "SELECT accession_number FROM filings WHERE filing_date >= %s AND accession_number IS NOT NULL",
+            (cutoff,)
+        )
+        return {row["accession_number"] for row in rows}
+    except Exception as e:
+        print(f"get_existing_accessions error: {e}")
+        return set()
+
+
+def insert_filing(f, xml_url=None):
+    """
+    Insert a filing row. Returns True if a new row was inserted, False if it was a duplicate.
+    Conflict key: accession_number (unique per SEC filing).
+    Falls back to (cik, ticker, filing_date, shares) if accession_number is NULL.
+    """
+    try:
+        # Check if accession_number already exists before inserting
+        if f.get("accession_number"):
+            existing = fetchone(
+                "SELECT id FROM filings WHERE accession_number = %s",
+                (f["accession_number"],)
+            )
+            if existing:
+                return False  # true duplicate
+
         execute("""
             INSERT INTO filings
               (cik, ticker, insider_name, insider_role, transaction_code,
-               shares, price, value, filing_date, filed_at, is_amendment, raw_xml_url)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (cik, ticker, filing_date, value) DO NOTHING
+               shares, price, value, filing_date, filed_at, is_amendment,
+               raw_xml_url, accession_number)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (cik, ticker, filing_date, shares) DO NOTHING
         """, (
             f["cik"], f["ticker"], f["insider_name"], f["insider_role"], "P",
             f["shares"], f["price"], f["value"],
-            f["filing_date"], f["filed_at"], f["is_amendment"], xml_url,
+            f["filing_date"], f["filed_at"], f["is_amendment"],
+            xml_url, f.get("accession_number"),
         ))
+        return True
     except Exception as e:
-        print(f"insert_filing error: {e}")
+        print(f"insert_filing error: {e} | accession: {f.get('accession_number')}")
+        return False
 
 
 def detect_clusters():
@@ -255,25 +287,50 @@ def detect_clusters():
 
 def main():
     entries = fetch_rss_entries()
-    new_count = 0
+    inserted = 0
     skipped = 0
+    duplicates = 0
+
+    # Pre-fetch known accessions to avoid redundant XML fetches
+    existing_accessions = get_existing_accessions()
+    print(f"Known accessions in DB (last 30d): {len(existing_accessions)}")
 
     for entry in entries:
         index_url = entry.get("link", "")
         if not index_url:
+            skipped += 1
             continue
+
+        accession = extract_accession_number(index_url)
+
+        # Skip XML fetch entirely if we already have this filing
+        if accession and accession in existing_accessions:
+            duplicates += 1
+            continue
+
         xml_url, xml_text = fetch_filing_xml(index_url)
         if not xml_text:
             skipped += 1
             continue
-        filings = parse_form4_xml(xml_text)
+
+        filings = parse_form4_xml(xml_text, accession_number=accession)
         for f in filings:
-            insert_filing(f, xml_url)
-            new_count += 1
+            was_inserted = insert_filing(f, xml_url)
+            if was_inserted:
+                inserted += 1
+            else:
+                duplicates += 1
 
     detect_clusters()
-    print(f"edgar_poll done: {len(entries)} entries, {skipped} skipped, {new_count} inserted.")
+    print(
+        f"edgar_poll done: {len(entries)} entries, "
+        f"{skipped} skipped (no XML), "
+        f"{duplicates} duplicates, "
+        f"{inserted} inserted."
+    )
 
 
 if __name__ == "__main__":
     main()
+EOF
+echo "Done"
