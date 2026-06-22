@@ -17,18 +17,69 @@ EDGAR_RSS = (
 HEADERS = {"User-Agent": "InsiderClusterBot admin@example.com"}
 
 
+def _fix_edgar_url(url, acc_dashed, cik):
+    """
+    EDGAR RSS emits scientific-notation folder paths like 1.7293662600001e+14.
+    Reconstruct the correct URL using the dashed accession number.
+    acc_dashed e.g. "0001729366-26-000010" -> nodash "000172936626000010"
+    """
+    acc_nodash = acc_dashed.replace("-", "")
+    return (
+        f"https://www.sec.gov/Archives/edgar/data/{cik}"
+        f"/{acc_nodash}/{acc_dashed}-index.htm"
+    )
+
+
 def fetch_rss_entries():
+    """
+    Returns list of dicts: {index_url, acc_dashed, cik, tag}
+    Reconstructs correct index URLs from the <id> accession number,
+    bypassing EDGAR's scientific-notation URL bug.
+    """
     try:
         resp = requests.get(EDGAR_RSS, headers=HEADERS, timeout=20)
         resp.raise_for_status()
-        feed = feedparser.parse(resp.text)
-        # Keep only actual Form 4 / Form 4A entries — filter by tag term
-        form4_entries = [
-            e for e in feed.entries
-            if any(t.get("term", "") in ("4", "4/A") for t in e.get("tags", []))
-        ]
-        print(f"RSS status: {resp.status_code}, total: {len(feed.entries)}, form4: {len(form4_entries)}")
-        return form4_entries
+
+        # Parse raw XML manually to extract id, link CIK, and tag
+        raw = resp.text
+
+        entries_raw = re.findall(r'<entry>(.*?)</entry>', raw, re.DOTALL)
+        results = []
+        seen_acc = set()
+
+        for block in entries_raw:
+            # Form type tag
+            tag_m = re.search(r'<category[^>]+term="([^"]+)"', block)
+            tag = tag_m.group(1) if tag_m else ""
+            if tag not in ("4", "4/A"):
+                continue
+
+            # Accession number from <id> — always clean, no scientific notation
+            id_m = re.search(r'accession-number=([\d-]+)', block)
+            if not id_m:
+                continue
+            acc_dashed = id_m.group(1)
+
+            if acc_dashed in seen_acc:
+                continue
+            seen_acc.add(acc_dashed)
+
+            # CIK from the <link> href (even with scientific notation, CIK part is correct)
+            cik_m = re.search(r'/Archives/edgar/data/(\d+)/', block)
+            if not cik_m:
+                continue
+            cik = cik_m.group(1)
+
+            index_url = _fix_edgar_url(None, acc_dashed, cik)
+            results.append({
+                "index_url":  index_url,
+                "acc_dashed": acc_dashed,
+                "cik":        cik,
+            })
+
+        print(f"RSS status: {resp.status_code}, total entries: {len(entries_raw)}, form4 unique: {len(results)}")
+        return results
+
     except Exception as e:
         print(f"fetch_rss_entries error: {e}")
         return []
@@ -36,37 +87,26 @@ def fetch_rss_entries():
 
 def fetch_filing_xml(index_url):
     """
-    Scrape the EDGAR index page and extract the raw Form 4 XML URL.
-    The index page lists all files; we take the .xml that is NOT the XSL renderer.
-    Key insight: the folder path may use scientific notation (e.g. 1.7293662600001e+14)
-    so we NEVER construct the URL manually — we always read it from the index page.
+    Scrape the EDGAR index page for the raw Form 4 XML href.
+    The index page hrefs use scientific notation paths — use them as-is, they resolve correctly.
     """
     try:
-        time.sleep(0.12)  # Respect SEC rate limit: max ~10 req/sec
+        time.sleep(0.12)
         resp = requests.get(index_url, headers=HEADERS, timeout=20)
         resp.raise_for_status()
         html = resp.text
 
-        # Match both single and double quoted hrefs containing .xml in Archives path
-        # Covers: href="/Archives/..." and href='/Archives/...'
+        # Match both quote styles; exclude XSL renderer
         all_xml = re.findall(
-            r'href=["\'](/Archives/edgar/data/[^"\']+\.xml)["\']',
+            r'href=["\']([^"\']+\.xml)["\']',
             html,
             re.IGNORECASE
         )
+        raw_xml_list = [
+            x for x in all_xml
+            if "xsl" not in x.lower() and x.startswith("/Archives")
+        ]
 
-        # Exclude the XSL renderer (visual HTML wrapper) — keep only raw data XML
-        raw_xml_list = [x for x in all_xml if "xslF345" not in x and "xsl" not in x.lower()]
-
-        if not raw_xml_list:
-            # Log what XML links were found (including xsl ones) for debugging
-            if all_xml:
-                print(f"fetch_filing_xml: only XSL XML found at {index_url}: {all_xml}")
-            else:
-                print(f"fetch_filing_xml: no .xml hrefs at all for {index_url}")
-            return None, None
-
-        # Fetch the first raw XML candidate
         for xml_path in raw_xml_list:
             xml_url = "https://www.sec.gov" + xml_path
             time.sleep(0.12)
@@ -75,12 +115,10 @@ def fetch_filing_xml(index_url):
                 xml_resp.raise_for_status()
                 if "<ownershipDocument" in xml_resp.text:
                     return xml_url, xml_resp.text
-                # Got XML but not ownershipDocument — could be a different form type
             except Exception as e:
                 print(f"fetch_filing_xml: error fetching {xml_url}: {e}")
                 continue
 
-        print(f"fetch_filing_xml: no ownershipDocument in any XML for {index_url}")
         return None, None
 
     except Exception as e:
@@ -102,12 +140,12 @@ def parse_form4_xml(xml_text):
             return []
         ticker = ticker.upper()
 
-        cik = find_text("issuerCik")
+        cik         = find_text("issuerCik")
         insider_name = find_text("rptOwnerName") or "Unknown"
-        insider_cik = find_text("rptOwnerCik") or cik
-        role_raw = find_text("officerTitle") or ""
+        insider_cik  = find_text("rptOwnerCik") or cik
+        role_raw     = find_text("officerTitle") or ""
 
-        doc_type = find_text("documentType") or ""
+        doc_type     = find_text("documentType") or ""
         is_amendment = doc_type.endswith("/A")
 
         period = find_text("periodOfReport")
@@ -174,13 +212,6 @@ def build_seen_keys():
 
 
 def insert_filing(f, xml_url=None):
-    """
-    Returns True if inserted, False if duplicate or error.
-    Conflict key: (cik, ticker, filing_date, shares) — avoids float drift on value.
-    Requires DB unique constraint:
-      ALTER TABLE filings ADD CONSTRAINT filings_unique_filing
-        UNIQUE (cik, ticker, filing_date, shares);
-    """
     try:
         execute("""
             INSERT INTO filings
@@ -272,20 +303,15 @@ def main():
 
     seen_keys = build_seen_keys()
 
-    for entry in entries:
-        index_url = entry.get("link", "")
-        if not index_url:
-            skipped += 1
-            continue
-
-        xml_url, xml_text = fetch_filing_xml(index_url)
+    for e in entries:
+        xml_url, xml_text = fetch_filing_xml(e["index_url"])
         if not xml_text:
             no_xml += 1
             continue
 
         filings = parse_form4_xml(xml_text)
         if not filings:
-            skipped += 1  # Form 4 with no qualifying P transactions
+            skipped += 1  # Form 4 exists but no qualifying P transactions
             continue
 
         for f in filings:
@@ -302,7 +328,7 @@ def main():
     detect_clusters()
     print(
         f"edgar_poll done: {len(entries)} form4 entries, "
-        f"{no_xml} no-XML, {skipped} skipped, "
+        f"{no_xml} no-XML, {skipped} no-P-transactions, "
         f"{duplicates} duplicates, {inserted} inserted."
     )
 
