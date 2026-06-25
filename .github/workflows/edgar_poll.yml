@@ -2,8 +2,11 @@ name: EDGAR Poll
 
 on:
   schedule:
-    - cron: "*/15 * * * 1-5"
-  workflow_dispatch: {}
+# FROM (once daily):
+- cron: '0 14 * * 1-5'
+
+# TO (every 15 minutes during market hours):
+- cron: '*/15 13-21 * * 1-5'
 
 jobs:
   poll:
