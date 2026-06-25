@@ -25,15 +25,37 @@ ROLE_KEYWORDS = {
 }
 
 
-def classify_role(title):
+def classify_role(title: str) -> str | None:
     if not title:
         return None
     t = title.lower().strip()
-    for role, keywords in ROLE_KEYWORDS.items():
-        if any(kw in t for kw in keywords):
-            return role
-    return None
 
+    if any(x in t for x in [
+        "chief executive", "ceo", "co-ceo", "co ceo",
+        "pres", "president",          # "President & CEO", "Pres., CEO"
+    ]):
+        return "CEO"
+
+    if any(x in t for x in [
+        "chief financial", "cfo",
+        "chief accounting", "cao",    # CFO-equivalent in small caps
+        "treasurer",
+    ]):
+        return "CFO"
+
+    if any(x in t for x in [
+        "chief operating", "coo",
+        "chief operations",
+    ]):
+        return "COO"
+
+    if any(x in t for x in [
+        "chairman", "chair of", "exec. chair", "executive chair",
+        "cob",                        # "Chair of the Board"
+    ]):
+        return "Chairman"
+
+    return None   # everything else → rejected
 
 def next_trading_day(d):
     next_day = d + timedelta(days=1)
