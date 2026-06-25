@@ -1,4 +1,5 @@
 import requests
+from datetime import timedelta
 from .config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 
@@ -7,10 +8,12 @@ def send_message(text: str):
     resp = requests.post(url, json={
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML"
+        "parse_mode": "Markdown"
     })
     resp.raise_for_status()
     return resp.json()
+
+
 def format_signal_alert(signal: dict) -> str:
     combined = signal['insider_1_value'] + signal['insider_2_value']
     return (
@@ -24,5 +27,6 @@ def format_signal_alert(signal: dict) -> str:
         f"💵 *Combined:* ${combined:,.0f}\n"
         f"📅 *Entry Date:* {signal['entry_date']}\n"
         f"⏳ *Window Closes:* {signal['entry_date'] + timedelta(days=5)}\n\n"
-        f"🔗 [View on OpenInsider](https://openinsider.com/{signal['ticker']})\n"
-        f"📊 [TradingView Chart](https://www.tradingview.com/chart/?symbol={signal['ticker']})"
+        f"🔗 https://openinsider.com/{signal['ticker']}\n"
+        f"📊 https://www.tradingview.com/chart/?symbol={signal['ticker']}"
+    )
