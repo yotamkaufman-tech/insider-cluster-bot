@@ -178,10 +178,10 @@ def parse_form4_xml(xml_text):
             if value < MIN_PURCHASE:
                 continue
 
-role = classify_role(role_raw)
-if role is None:
-    print(f"  ROLE REJECTED: ticker={ticker} raw_title='{role_raw}'")
-    continue
+            role = classify_role(role_raw)
+            if role is None:
+                print(f"  ROLE REJECTED: ticker={ticker} raw_title='{role_raw}'")
+                continue
 
             results.append({
                 "cik":          insider_cik,
@@ -198,11 +198,6 @@ if role is None:
 
     except Exception as e:
         print(f"parse_form4_xml error: {e}")
-
-    role = classify_role(role_raw)
-if role is None:
-    print(f"  ROLE REJECTED: ticker={ticker} raw_title='{role_raw}'")  # ← add this
-    continue
 
     return results
 
