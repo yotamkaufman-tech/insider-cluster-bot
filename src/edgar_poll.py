@@ -1,7 +1,6 @@
 import re
 import time
 import requests
-import feedparser
 from lxml import etree
 from datetime import datetime, timezone, date, timedelta
 
@@ -10,125 +9,99 @@ from .db import fetchall, execute, fetchone
 from .business_rules import classify_role, next_trading_day
 from .telegram_alerts import send_message
 
-EDGAR_RSS = (
-    "https://www.sec.gov/cgi-bin/browse-edgar"
-    "?action=getcurrent&type=4&owner=include&count=100&output=atom"
-)
-HEADERS = {"User-Agent": "InsiderClusterBot admin@example.com"}
+# ── EDGAR endpoints ───────────────────────────────────────────────────────────
+# Switched from RSS (returns all filing types, only ~4% are Form 4s) to
+# EFTS full-text search API which returns ONLY Form 4s — 500+ per day.
+EFTS_URL = "https://efts.sec.gov/LATEST/search-index"
+HEADERS  = {"User-Agent": "InsiderClusterBot admin@example.com"}
+
+MAX_EFTS_PAGES = 6   # 6 × 100 = 600 filings max per poll run (covers full day)
 
 
-def _fix_edgar_url(url, acc_dashed, cik):
-    acc_nodash = acc_dashed.replace("-", "")
-    return (
-        f"https://www.sec.gov/Archives/edgar/data/{cik}"
-        f"/{acc_nodash}/{acc_dashed}-index.htm"
-    )
-
+# ── Fetch Form 4 entries from EFTS ────────────────────────────────────────────
 
 def fetch_rss_entries():
     """
+    Fetches today's + yesterday's Form 4 filings from the EDGAR EFTS API.
     Returns list of dicts: {index_url, acc_dashed, cik}
-    Tries multiple regex patterns to extract accession number from EDGAR RSS
-    entries, since EDGAR occasionally changes the <id> / <link> format.
-    Prints ACC_MISSING for any entry that fails all patterns so the raw
-    block is visible in logs for further debugging.
+
+    Replaces the old RSS-based approach which returned all filing types mixed
+    together — only ~4 of every 100 entries were Form 4s, causing 96% to be
+    silently dropped.
     """
-    try:
-        resp = requests.get(EDGAR_RSS, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        raw = resp.text
+    today     = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
 
-        entries_raw = re.findall(r'<entry>(.*?)</entry>', raw, re.DOTALL)
-        results = []
-        seen_acc = set()
+    results  = []
+    seen_acc = set()
 
-        for block in entries_raw:
-            # Form type tag — only process Form 4 and 4/A
-            tag_m = re.search(r'<category[^>]+term="([^"]+)"', block)
-            tag = tag_m.group(1) if tag_m else ""
-            if tag not in ("4", "4/A"):
-                continue
+    for page in range(MAX_EFTS_PAGES):
+        params = {
+            "q":         '""',
+            "dateRange": "custom",
+            "startdt":   yesterday,
+            "enddt":     today,
+            "forms":     "4",
+            "from":      page * 100,
+        }
+        try:
+            resp = requests.get(EFTS_URL, params=params, headers=HEADERS, timeout=20)
+            resp.raise_for_status()
+            data  = resp.json()
+            hits  = data.get("hits", {}).get("hits", [])
+            total = data.get("hits", {}).get("total", {}).get("value", 0)
 
-            # ── Try multiple accession number patterns ──────────────────
-            acc_dashed = None
+            if page == 0:
+                print(f"EFTS status: {resp.status_code}, total Form 4s today: {total}")
 
-            # Pattern 1: accession-number=0001234567-26-000001
-            m = re.search(r'accession-number=([\d]{10}-[\d]{2}-[\d]{6})', block)
-            if m:
-                acc_dashed = m.group(1)
+            if not hits:
+                break
 
-            # Pattern 2: accession-number= without strict length (original pattern)
-            if not acc_dashed:
-                m = re.search(r'accession-number=([\d-]+)', block)
-                if m:
-                    acc_dashed = m.group(1)
+            for hit in hits:
+                src        = hit.get("_source", {})
+                acc_dashed = src.get("adsh", "")
+                ciks       = src.get("ciks", [])
 
-            # Pattern 3: extract from <id> tag URL directly
-            # e.g. <id>https://www.sec.gov/Archives/edgar/data/123/000123-26-001.txt</id>
-            if not acc_dashed:
-                m = re.search(r'<id>[^<]*/(\d{10}-\d{2}-\d{6})', block)
-                if m:
-                    acc_dashed = m.group(1)
+                if not acc_dashed or not ciks:
+                    continue
 
-            # Pattern 4: extract from any URL in the block
-            if not acc_dashed:
-                m = re.search(r'/(\d{10}-\d{2}-\d{6})', block)
-                if m:
-                    acc_dashed = m.group(1)
+                if acc_dashed in seen_acc:
+                    continue
+                seen_acc.add(acc_dashed)
 
-            # Pattern 5: accession number without dashes (18 digits), reformat
-            if not acc_dashed:
-                m = re.search(r'accession.{0,10}?(\d{18})', block, re.IGNORECASE)
-                if m:
-                    raw_acc = m.group(1)
-                    acc_dashed = f"{raw_acc[:10]}-{raw_acc[10:12]}-{raw_acc[12:]}"
+                # Use first CIK (reporter) to build the index URL — always resolves
+                cik        = ciks[0].lstrip("0")
+                acc_nodash = acc_dashed.replace("-", "")
+                index_url  = (
+                    f"https://www.sec.gov/Archives/edgar/data/{cik}"
+                    f"/{acc_nodash}/{acc_dashed}-index.htm"
+                )
+                results.append({
+                    "index_url":  index_url,
+                    "acc_dashed": acc_dashed,
+                    "cik":        cik,
+                })
 
-            if not acc_dashed:
-                print(f"  ACC_MISSING: {block[:200]}")
-                continue
+            # Stop paginating if we've got all results
+            if len(results) >= total:
+                break
 
-            if acc_dashed in seen_acc:
-                continue
-            seen_acc.add(acc_dashed)
+            time.sleep(0.1)
 
-            # ── Extract CIK ─────────────────────────────────────────────
-            cik = None
+        except Exception as e:
+            print(f"fetch_rss_entries error (page {page}): {e}")
+            break
 
-            # Pattern 1: /Archives/edgar/data/1234567/
-            m = re.search(r'/Archives/edgar/data/(\d+)/', block)
-            if m:
-                cik = m.group(1)
+    print(f"Form 4 entries fetched: {len(results)}")
+    return results
 
-            # Pattern 2: <id> tag with CIK
-            if not cik:
-                m = re.search(r'edgar/data/(\d+)', block)
-                if m:
-                    cik = m.group(1)
 
-            if not cik:
-                print(f"  CIK_MISSING for acc={acc_dashed}: {block[:200]}")
-                continue
-
-            index_url = _fix_edgar_url(None, acc_dashed, cik)
-            results.append({
-                "index_url":  index_url,
-                "acc_dashed": acc_dashed,
-                "cik":        cik,
-            })
-
-        print(
-            f"RSS status: {resp.status_code}, "
-            f"total entries: {len(entries_raw)}, "
-            f"form4 unique: {len(results)}"
-        )
-        return results
-
-    except Exception as e:
-        print(f"fetch_rss_entries error: {e}")
-        return []
-
+# ── Fetch individual filing XML (unchanged) ───────────────────────────────────
 
 def fetch_filing_xml(index_url):
+    """
+    Scrape the EDGAR index page for the raw Form 4 XML href.
+    """
     try:
         time.sleep(0.12)
         resp = requests.get(index_url, headers=HEADERS, timeout=20)
@@ -163,6 +136,8 @@ def fetch_filing_xml(index_url):
         print(f"fetch_filing_xml error ({index_url}): {e}")
         return None, None
 
+
+# ── Parse Form 4 XML (unchanged, debug print retained) ───────────────────────
 
 def parse_form4_xml(xml_text):
     results = []
@@ -240,6 +215,8 @@ def parse_form4_xml(xml_text):
     return results
 
 
+# ── DB helpers (unchanged) ────────────────────────────────────────────────────
+
 def build_seen_keys():
     try:
         rows = fetchall("SELECT cik, ticker, filing_date, shares FROM filings")
@@ -270,6 +247,8 @@ def insert_filing(f, xml_url=None):
         print(f"insert_filing error: {e}")
         return False
 
+
+# ── Cluster detection (unchanged) ─────────────────────────────────────────────
 
 def detect_clusters():
     cutoff = date.today() - timedelta(days=CLUSTER_WINDOW_DAYS)
@@ -334,6 +313,8 @@ def detect_clusters():
             f"{i2['insider_name']} ({i2['insider_role']}) ${float(i2['value']):,.0f}"
         )
 
+
+# ── Main (unchanged) ──────────────────────────────────────────────────────────
 
 def main():
     entries    = fetch_rss_entries()
