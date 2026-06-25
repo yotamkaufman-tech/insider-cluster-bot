@@ -1,31 +1,27 @@
-name: EDGAR Poll
+name: Edgar Poll
 
 on:
   schedule:
-# FROM (once daily):
-- cron: '0 14 * * 1-5'
-
-# TO (every 15 minutes during market hours):
-- cron: '*/15 13-21 * * 1-5'
+    - cron: '0 14 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4.2.2
 
-      - uses: actions/setup-python@v5.6.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r src/requirements.txt
 
-      - name: Run EDGAR poll
+      - name: Run edgar poll
+        run: python -m src.edgar_poll
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PYTHONPATH: ${{ github.workspace }}
-        run: python -m src.edgar_poll
