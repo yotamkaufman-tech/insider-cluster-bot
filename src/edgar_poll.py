@@ -10,25 +10,15 @@ from .business_rules import classify_role, next_trading_day
 from .telegram_alerts import send_message
 
 # ── EDGAR endpoints ───────────────────────────────────────────────────────────
-# Switched from RSS (returns all filing types, only ~4% are Form 4s) to
-# EFTS full-text search API which returns ONLY Form 4s — 500+ per day.
 EFTS_URL = "https://efts.sec.gov/LATEST/search-index"
 HEADERS  = {"User-Agent": "InsiderClusterBot admin@example.com"}
 
-MAX_EFTS_PAGES = 6   # 6 × 100 = 600 filings max per poll run (covers full day)
+MAX_EFTS_PAGES = 6   # 6 × 100 = 600 filings max per poll run
 
 
 # ── Fetch Form 4 entries from EFTS ────────────────────────────────────────────
 
 def fetch_rss_entries():
-    """
-    Fetches today's + yesterday's Form 4 filings from the EDGAR EFTS API.
-    Returns list of dicts: {index_url, acc_dashed, cik}
-
-    Replaces the old RSS-based approach which returned all filing types mixed
-    together — only ~4 of every 100 entries were Form 4s, causing 96% to be
-    silently dropped.
-    """
     today     = date.today().isoformat()
     yesterday = (date.today() - timedelta(days=1)).isoformat()
 
@@ -64,12 +54,10 @@ def fetch_rss_entries():
 
                 if not acc_dashed or not ciks:
                     continue
-
                 if acc_dashed in seen_acc:
                     continue
                 seen_acc.add(acc_dashed)
 
-                # Use first CIK (reporter) to build the index URL — always resolves
                 cik        = ciks[0].lstrip("0")
                 acc_nodash = acc_dashed.replace("-", "")
                 index_url  = (
@@ -82,7 +70,6 @@ def fetch_rss_entries():
                     "cik":        cik,
                 })
 
-            # Stop paginating if we've got all results
             if len(results) >= total:
                 break
 
@@ -96,12 +83,9 @@ def fetch_rss_entries():
     return results
 
 
-# ── Fetch individual filing XML (unchanged) ───────────────────────────────────
+# ── Fetch individual filing XML ───────────────────────────────────────────────
 
 def fetch_filing_xml(index_url):
-    """
-    Scrape the EDGAR index page for the raw Form 4 XML href.
-    """
     try:
         time.sleep(0.12)
         resp = requests.get(index_url, headers=HEADERS, timeout=20)
@@ -137,7 +121,7 @@ def fetch_filing_xml(index_url):
         return None, None
 
 
-# ── Parse Form 4 XML (unchanged, debug print retained) ───────────────────────
+# ── Parse Form 4 XML ──────────────────────────────────────────────────────────
 
 def parse_form4_xml(xml_text):
     results = []
@@ -153,11 +137,14 @@ def parse_form4_xml(xml_text):
             return []
         ticker = ticker.upper()
 
+        # Skip invalid tickers
+        if ticker in ("NONE", "N/A", ""):
+            return []
+
         cik          = find_text("issuerCik")
         insider_name = find_text("rptOwnerName") or "Unknown"
         insider_cik  = find_text("rptOwnerCik") or cik
 
-        # Try officerTitle first, then otherText as fallback
         role_raw = find_text("officerTitle") or find_text("otherText") or ""
 
         doc_type     = find_text("documentType") or ""
@@ -215,7 +202,7 @@ def parse_form4_xml(xml_text):
     return results
 
 
-# ── DB helpers (unchanged) ────────────────────────────────────────────────────
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
 def build_seen_keys():
     try:
@@ -248,7 +235,7 @@ def insert_filing(f, xml_url=None):
         return False
 
 
-# ── Cluster detection (unchanged) ─────────────────────────────────────────────
+# ── Cluster detection ─────────────────────────────────────────────────────────
 
 def detect_clusters():
     cutoff = date.today() - timedelta(days=CLUSTER_WINDOW_DAYS)
@@ -259,13 +246,18 @@ def detect_clusters():
     for row in rows:
         ticker = row["ticker"]
 
+        # Skip if already has an open position
         if fetchone("SELECT id FROM positions WHERE ticker=%s AND status='OPEN'", (ticker,)):
             continue
+
+        # ── KEY FIX: skip if any signal already exists for this ticker ────────
+        # (replaces ON CONFLICT DO NOTHING which was silently re-alerting)
         if fetchone(
-            "SELECT id FROM signals WHERE ticker=%s AND status IN ('PENDING','SCHEDULED','CONFIRMED')",
+            "SELECT id FROM signals WHERE ticker=%s",
             (ticker,)
         ):
             continue
+        # ─────────────────────────────────────────────────────────────────────
 
         filings = fetchall("""
             SELECT DISTINCT cik, insider_name, insider_role, filing_date, value
@@ -288,6 +280,8 @@ def detect_clusters():
 
         cluster_type = "A" if i1["filing_date"] == i2["filing_date"] else "B"
         entry_date   = next_trading_day(i2["filing_date"])
+        combined     = float(i1["value"]) + float(i2["value"])
+        window_close = entry_date + timedelta(days=5)
 
         execute("""
             INSERT INTO signals
@@ -297,7 +291,6 @@ def detect_clusters():
                filing_date_1, filing_date_2,
                detection_time, entry_date, status)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'PENDING')
-            ON CONFLICT DO NOTHING
         """, (
             ticker, cluster_type,
             i1["insider_name"], i1["insider_role"], float(i1["value"]),
@@ -306,15 +299,23 @@ def detect_clusters():
             datetime.now(timezone.utc), entry_date,
         ))
 
+        # ── Rich Telegram alert (fires only for genuinely new signals) ────────
         send_message(
-            f"🔔 NEW CLUSTER {ticker} Type {cluster_type}\n"
-            f"Entry: {entry_date}\n"
-            f"{i1['insider_name']} ({i1['insider_role']}) ${float(i1['value']):,.0f}\n"
-            f"{i2['insider_name']} ({i2['insider_role']}) ${float(i2['value']):,.0f}"
+            f"🚨 *CLUSTER SIGNAL — {ticker}* (Type {cluster_type})\n\n"
+            f"👤 *{i1['insider_role']}:* {i1['insider_name']}\n"
+            f"   💰 ${float(i1['value']):,.0f} on {i1['filing_date']}\n\n"
+            f"👤 *{i2['insider_role']}:* {i2['insider_name']}\n"
+            f"   💰 ${float(i2['value']):,.0f} on {i2['filing_date']}\n\n"
+            f"💵 *Combined:* ${combined:,.0f}\n"
+            f"📅 *Entry date:* {entry_date}\n"
+            f"⏳ *Window closes:* {window_close}\n\n"
+            f"📊 https://www.tradingview.com/chart/?symbol={ticker}\n"
+            f"🔎 https://openinsider.com/{ticker}"
         )
+        print(f"  SIGNAL + ALERT: {ticker} Type {cluster_type} entry={entry_date}")
 
 
-# ── Main (unchanged) ──────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     entries    = fetch_rss_entries()
