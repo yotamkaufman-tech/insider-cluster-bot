@@ -1,6 +1,5 @@
 requests
-feedparser
-psycopg2-binary
-python-dateutil
-yfinance
 lxml
+psycopg2-binary
+python-telegram-bot
+yfinance
