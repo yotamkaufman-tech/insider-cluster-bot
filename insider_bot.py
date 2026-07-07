@@ -309,7 +309,7 @@ def fetch_entries(days_back=1):
                 time.sleep(wait)
         if not success:
             print('fetch_entries page ' + str(page) + ' failed after retries: ' + str(last_err))
-            break
+            continue
     print('Entries fetched: ' + str(len(results)))
     return results
 
