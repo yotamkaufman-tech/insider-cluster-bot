@@ -266,37 +266,49 @@ def fetch_entries(days_back=1):
     start  = (date.today() - timedelta(days=days_back)).isoformat()
     results, seen = [], set()
     for page in range(6):
-        try:
-            r = requests.get(EFTS_URL, headers=HEADERS, timeout=20, params={
-                'q': '""', 'dateRange': 'custom',
-                'startdt': start, 'enddt': today,
-                'forms': '4', 'from': page * 100
-            })
-            r.raise_for_status()
-            data  = r.json()
-            hits  = data.get('hits', {}).get('hits', [])
-            total = data.get('hits', {}).get('total', {}).get('value', 0)
-            if page == 0:
-                print('EFTS status=' + str(r.status_code) + ' total=' + str(total))
-            if not hits:
+        success = False
+        last_err = None
+        for attempt in range(3):
+            try:
+                r = requests.get(EFTS_URL, headers=HEADERS, timeout=20, params={
+                    'q': '""', 'dateRange': 'custom',
+                    'startdt': start, 'enddt': today,
+                    'forms': '4', 'from': page * 100
+                })
+                r.raise_for_status()
+                data  = r.json()
+                hits  = data.get('hits', {}).get('hits', [])
+                total = data.get('hits', {}).get('total', {}).get('value', 0)
+                if page == 0:
+                    print('EFTS status=' + str(r.status_code) + ' total=' + str(total))
+                if not hits:
+                    success = True
+                    break
+                for h in hits:
+                    src  = h.get('_source', {})
+                    acc  = src.get('adsh', '')
+                    ciks = src.get('ciks', [])
+                    if not acc or not ciks or acc in seen:
+                        continue
+                    seen.add(acc)
+                    cik = ciks[0].lstrip('0')
+                    nd  = acc.replace('-', '')
+                    results.append({'index_url':
+                        'https://www.sec.gov/Archives/edgar/data/' + cik +
+                        '/' + nd + '/' + acc + '-index.htm'})
+                if len(results) >= total:
+                    success = True
+                    break
+                time.sleep(0.1)
+                success = True
                 break
-            for h in hits:
-                src  = h.get('_source', {})
-                acc  = src.get('adsh', '')
-                ciks = src.get('ciks', [])
-                if not acc or not ciks or acc in seen:
-                    continue
-                seen.add(acc)
-                cik = ciks[0].lstrip('0')
-                nd  = acc.replace('-', '')
-                results.append({'index_url':
-                    'https://www.sec.gov/Archives/edgar/data/' + cik +
-                    '/' + nd + '/' + acc + '-index.htm'})
-            if len(results) >= total:
-                break
-            time.sleep(0.1)
-        except Exception as e:
-            print('fetch_entries page ' + str(page) + ' error: ' + str(e))
+            except Exception as e:
+                last_err = e
+                wait = 1.5 * (2 ** attempt)
+                print('fetch_entries page ' + str(page) + ' attempt ' + str(attempt + 1) + ' error: ' + str(e) + ' — retry in ' + str(wait) + 's')
+                time.sleep(wait)
+        if not success:
+            print('fetch_entries page ' + str(page) + ' failed after retries: ' + str(last_err))
             break
     print('Entries fetched: ' + str(len(results)))
     return results
