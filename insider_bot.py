@@ -1,5 +1,4 @@
-from pathlib import Path
-code = r'''#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 insider_bot.py
 Single-file insider cluster signal bot.
@@ -21,7 +20,6 @@ TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 NOTION_TOKEN     = os.environ.get('NOTION_TOKEN', '')
 NOTION_DB_ID     = os.environ.get('NOTION_DATABASE_ID', '')
-NOTION_REJECTED_DB_ID = os.environ.get('NOTION_REJECTED_DB_ID', '')
 TEST_MODE        = os.environ.get('TEST_MODE', '0') == '1'
 
 MIN_PURCHASE   = 50_000
@@ -50,9 +48,7 @@ ROLE_KEYWORDS = {
                  'executive chairman','exec. chairman','cob'],
 }
 
-SECONDARY_EXEC_PATTERNS = [
-    'vp', 'vice president', 'senior vice president', 'evp', 'svp', 'chief'
-]
+SECONDARY_PATTERNS = ['vp', 'vice president', 'senior vice president', 'evp', 'svp', 'chief']
 
 NYSE_HOLIDAYS = {
     date(2026,1,1),  date(2026,1,19), date(2026,2,16),
@@ -160,17 +156,12 @@ def _np(text):
 def _nt(text):
     return {'title': [{'text': {'content': str(text)}}]}
 
-def _ns(text):
-    return {'select': {'name': str(text)}} if text else {'select': None}
 
-
-def append_to_notion(row, db_id=None):
-    if not NOTION_TOKEN:
-        print('  [Notion] NOTION_TOKEN not set — skipping')
-        return False
-    target_db = db_id or NOTION_DB_ID
-    if not target_db:
-        print('  [Notion] database id not set — skipping')
+def append_to_notion(row):
+    # row: [ticker, ctype, i1name, i1role, i1val, i2name, i2role, i2val,
+    #        date1, date2, combined, entry, exit_by, status, reason, detected]
+    if not NOTION_TOKEN or not NOTION_DB_ID:
+        print('  [Notion] NOTION_TOKEN or NOTION_DATABASE_ID not set — skipping')
         return False
     props = {
         'Ticker':    _nt(row[0]),
@@ -194,7 +185,7 @@ def append_to_notion(row, db_id=None):
         resp = requests.post(
             'https://api.notion.com/v1/pages',
             headers=NOTION_HDRS,
-            json={'parent': {'database_id': target_db}, 'properties': props},
+            json={'parent': {'database_id': NOTION_DB_ID}, 'properties': props},
             timeout=10
         )
         if resp.status_code == 200:
@@ -350,6 +341,7 @@ def parse_xml(xml_text):
         name     = ft('rptOwnerName') or 'Unknown'
         cik      = ft('rptOwnerCik') or ft('issuerCik') or ''
         role_raw = ft('officerTitle') or ft('otherText') or ''
+        company   = ft('issuerName') or ''
         amended  = (ft('documentType') or '').endswith('/A')
         fd       = date.today()
         p        = ft('periodOfReport')
@@ -361,8 +353,8 @@ def parse_xml(xml_text):
             code  = txn.find('.//transactionCode')
             sh    = txn.find('.//transactionShares/value')
             price = txn.find('.//transactionPricePerShare/value')
-            if code is None or code.text != 'P':
-                continue
+            if code is None or code.text != 'P': continue
+            if sh is None or price is None: continue
             shares = safe_num(sh.text if sh is not None else None)
             px     = safe_num(price.text if price is not None else None)
             if shares is None or px is None:
@@ -370,7 +362,7 @@ def parse_xml(xml_text):
             value = shares * px
             if value < MIN_PURCHASE:
                 continue
-            role = classify_role(role_raw, ticker)
+            role = classify_role(role_raw, company)
             if role == 'Other':
                 continue
             results.append({
@@ -378,7 +370,7 @@ def parse_xml(xml_text):
                 'insider_cik': cik, 'insider_role': role,
                 'value': value, 'filing_date': fd, 'amended': amended,
                 'role_raw': role_raw, 'stock_price': px, 'shares': shares,
-                'transaction_code': 'P', 'company': ticker
+                'transaction_code': 'P', 'company': company
             })
     except Exception as e:
         print('parse_xml error: ' + str(e))
@@ -398,13 +390,11 @@ def detect_clusters(filings):
     for ticker, rows in by_ticker.items():
         seen_ciks = {}
         for r in sorted(rows, key=lambda x: x['filing_date']):
-            if r['filing_date'] < cutoff:
-                continue
+            if r['filing_date'] < cutoff: continue
             if r['insider_cik'] not in seen_ciks:
                 seen_ciks[r['insider_cik']] = r
         unique = sorted(seen_ciks.values(), key=lambda x: x['filing_date'])
-        if len(unique) < 2:
-            continue
+        if len(unique) < 2: continue
         i1, i2 = unique[0], unique[1]
         ctype  = 'A' if i1['filing_date'] == i2['filing_date'] else 'B'
         entry  = next_trading_day(i2['filing_date'])
@@ -557,7 +547,3 @@ if __name__ == '__main__':
         run_smoke_test()
     else:
         main()
-'''
-Path('/root/insider_bot_patched.py').write_text(code)
-print('Wrote /root/insider_bot_patched.py')
-print(code[:1200])
