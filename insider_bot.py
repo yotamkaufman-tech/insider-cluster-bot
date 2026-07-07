@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+from pathlib import Path
+code = r'''#!/usr/bin/env python3
 """
 insider_bot.py
 Single-file insider cluster signal bot.
@@ -13,12 +14,14 @@ import os, re, time, requests
 from lxml import etree
 from datetime import date, datetime, timedelta, timezone
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 NOTION_TOKEN     = os.environ.get('NOTION_TOKEN', '')
 NOTION_DB_ID     = os.environ.get('NOTION_DATABASE_ID', '')
+NOTION_REJECTED_DB_ID = os.environ.get('NOTION_REJECTED_DB_ID', '')
 TEST_MODE        = os.environ.get('TEST_MODE', '0') == '1'
 
 MIN_PURCHASE   = 50_000
@@ -37,13 +40,19 @@ NOTION_HDRS    = {
 ROLE_KEYWORDS = {
     'CEO':      ['chief executive','ceo','co-ceo','interim ceo',
                  'president & ceo','president and ceo','president/ceo',
-                 'pres, ceo','pres, chief executive','pres. & ceo'],
+                 'pres, ceo','pres, chief executive','pres. & ceo',
+                 'chairman of the board','exec chair'],
     'CFO':      ['chief financial','cfo','svp finance','evp finance',
-                 'exec vp, cfo','treasurer and cfo'],
-    'COO':      ['chief operating','coo','evp operations','svp operations'],
+                 'exec vp, cfo','treasurer and cfo','finance officer'],
+    'COO':      ['chief operating','coo','evp operations','svp operations',
+                 'president of operations','vp upstream','vp operations'],
     'Chairman': ['chairman','chair of the board','exec chair',
                  'executive chairman','exec. chairman','cob'],
 }
+
+SECONDARY_EXEC_PATTERNS = [
+    'vp', 'vice president', 'senior vice president', 'evp', 'svp', 'chief'
+]
 
 NYSE_HOLIDAYS = {
     date(2026,1,1),  date(2026,1,19), date(2026,2,16),
@@ -54,12 +63,65 @@ NYSE_HOLIDAYS = {
 
 # ── HELPERS ───────────────────────────────────────────────────────────────
 
-def classify_role(raw):
-    t = raw.lower().strip()
+def safe_num(x, default=None):
+    if x is None:
+        return default
+    if isinstance(x, (int, float, Decimal)):
+        return float(x)
+    s = str(x).strip().replace(',', '')
+    if not s or s.upper() in {'#ERROR!', 'N/A', 'NA', 'NONE', 'NULL'}:
+        return default
+    try:
+        return float(Decimal(s))
+    except (InvalidOperation, ValueError):
+        return default
+
+
+def classify_role(raw, company=''):
+    t = (raw or '').lower().strip()
+    c = (company or '').lower().strip()
     for role, kws in ROLE_KEYWORDS.items():
         if any(kw in t for kw in kws):
             return role
+    if any(p in t for p in SECONDARY_EXEC_PATTERNS):
+        if any(p in t for p in ['upstream', 'operations', 'finance']):
+            return 'Other C-Level'
+        if any(p in c for p in ['petroleum', 'energy', 'exploration', 'oil', 'gas']):
+            return 'Other C-Level'
+    return 'Other'
+
+
+def parse_trade_value(entry):
+    val = safe_num(entry.get('value'))
+    if val is not None:
+        return val
+    shares = safe_num(entry.get('shares'))
+    price = safe_num(entry.get('stock_price'))
+    if shares is not None and price is not None:
+        return round(shares * price, 2)
     return None
+
+
+def safe_entry_from_raw(raw):
+    e = dict(raw)
+    e['stock_price'] = safe_num(raw.get('stock_price'))
+    e['shares'] = safe_num(raw.get('shares'))
+    e['value'] = parse_trade_value(raw)
+    e['role'] = classify_role(raw.get('role_raw', ''), raw.get('company', ''))
+    return e
+
+
+def qualifies_form4(entry):
+    reasons = []
+    if (entry.get('transaction_code') or '').upper() != 'P':
+        reasons.append('not_code_p')
+    if entry.get('role') == 'Other':
+        reasons.append('wrong_role')
+    if (entry.get('value') or 0) < MIN_PURCHASE:
+        reasons.append('under_50k')
+    if (entry.get('stock_price') or 0) < 5.0:
+        reasons.append('price_below_5')
+    return reasons
 
 
 def next_trading_day(d):
@@ -98,12 +160,17 @@ def _np(text):
 def _nt(text):
     return {'title': [{'text': {'content': str(text)}}]}
 
+def _ns(text):
+    return {'select': {'name': str(text)}} if text else {'select': None}
 
-def append_to_notion(row):
-    # row: [ticker, ctype, i1name, i1role, i1val, i2name, i2role, i2val,
-    #        date1, date2, combined, entry, exit_by, status, reason, detected]
-    if not NOTION_TOKEN or not NOTION_DB_ID:
-        print('  [Notion] NOTION_TOKEN or NOTION_DATABASE_ID not set — skipping')
+
+def append_to_notion(row, db_id=None):
+    if not NOTION_TOKEN:
+        print('  [Notion] NOTION_TOKEN not set — skipping')
+        return False
+    target_db = db_id or NOTION_DB_ID
+    if not target_db:
+        print('  [Notion] database id not set — skipping')
         return False
     props = {
         'Ticker':    _nt(row[0]),
@@ -127,7 +194,7 @@ def append_to_notion(row):
         resp = requests.post(
             'https://api.notion.com/v1/pages',
             headers=NOTION_HDRS,
-            json={'parent': {'database_id': NOTION_DB_ID}, 'properties': props},
+            json={'parent': {'database_id': target_db}, 'properties': props},
             timeout=10
         )
         if resp.status_code == 200:
@@ -294,22 +361,24 @@ def parse_xml(xml_text):
             code  = txn.find('.//transactionCode')
             sh    = txn.find('.//transactionShares/value')
             price = txn.find('.//transactionPricePerShare/value')
-            if code is None or code.text != 'P': continue
-            if sh is None or price is None: continue
-            try:
-                shares = float(sh.text)
-                px     = float(price.text)
-            except (ValueError, TypeError):
+            if code is None or code.text != 'P':
+                continue
+            shares = safe_num(sh.text if sh is not None else None)
+            px     = safe_num(price.text if price is not None else None)
+            if shares is None or px is None:
                 continue
             value = shares * px
-            if value < MIN_PURCHASE: continue
-            role = classify_role(role_raw)
-            if role is None:
+            if value < MIN_PURCHASE:
+                continue
+            role = classify_role(role_raw, ticker)
+            if role == 'Other':
                 continue
             results.append({
                 'ticker': ticker, 'insider_name': name,
                 'insider_cik': cik, 'insider_role': role,
-                'value': value, 'filing_date': fd, 'amended': amended
+                'value': value, 'filing_date': fd, 'amended': amended,
+                'role_raw': role_raw, 'stock_price': px, 'shares': shares,
+                'transaction_code': 'P', 'company': ticker
             })
     except Exception as e:
         print('parse_xml error: ' + str(e))
@@ -329,11 +398,13 @@ def detect_clusters(filings):
     for ticker, rows in by_ticker.items():
         seen_ciks = {}
         for r in sorted(rows, key=lambda x: x['filing_date']):
-            if r['filing_date'] < cutoff: continue
+            if r['filing_date'] < cutoff:
+                continue
             if r['insider_cik'] not in seen_ciks:
                 seen_ciks[r['insider_cik']] = r
         unique = sorted(seen_ciks.values(), key=lambda x: x['filing_date'])
-        if len(unique) < 2: continue
+        if len(unique) < 2:
+            continue
         i1, i2 = unique[0], unique[1]
         ctype  = 'A' if i1['filing_date'] == i2['filing_date'] else 'B'
         entry  = next_trading_day(i2['filing_date'])
@@ -486,3 +557,7 @@ if __name__ == '__main__':
         run_smoke_test()
     else:
         main()
+'''
+Path('/root/insider_bot_patched.py').write_text(code)
+print('Wrote /root/insider_bot_patched.py')
+print(code[:1200])
