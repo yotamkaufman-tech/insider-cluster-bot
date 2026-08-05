@@ -2,7 +2,7 @@ name: Edgar Poll
 
 on:
   schedule:
-    - cron: '0 14 * * 1-5'
+    - cron: '*/15 13-21 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -10,18 +10,25 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests lxml yfinance
 
-      - name: Run edgar poll
-        run: python -m src.edgar_poll
+      - name: Run Edgar poll
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          TEST_MODE: ${{ secrets.TEST_MODE }}
+        run: python edgar_poll.py
