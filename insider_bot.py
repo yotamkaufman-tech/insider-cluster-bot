@@ -41,14 +41,16 @@ ROLE_KEYWORDS = {
                  'pres, ceo','pres, chief executive','pres. & ceo',
                  'chairman of the board','exec chair'],
     'CFO':      ['chief financial','cfo','svp finance','evp finance',
-                 'exec vp, cfo','treasurer and cfo','finance officer'],
+                 'exec vp, cfo','treasurer and cfo','finance officer',
+                 'president & cfo','pres, cfo'],
     'COO':      ['chief operating','coo','evp operations','svp operations',
                  'president of operations','vp upstream','vp operations'],
     'Chairman': ['chairman','chair of the board','exec chair',
                  'executive chairman','exec. chairman','cob'],
 }
 
-SECONDARY_PATTERNS = ['vp', 'vice president', 'senior vice president', 'evp', 'svp', 'chief']
+NON_CORE_EXEC_PATTERNS = ['evp', 'svp', 'vp', 'executive vice president', 'senior vice president', 'm&a', 'mergers', 'acquisitions', 'corporate affairs', 'operations']
+SECONDARY_EXEC_PATTERNS = NON_CORE_EXEC_PATTERNS
 
 NYSE_HOLIDAYS = {
     date(2026,1,1),  date(2026,1,19), date(2026,2,16),
@@ -85,6 +87,14 @@ def classify_role(raw, company=''):
         if any(p in c for p in ['petroleum', 'energy', 'exploration', 'oil', 'gas']):
             return 'Other C-Level'
     return 'Other'
+
+
+def normalize_role(raw_role: str):
+    return classify_role(raw_role)
+
+
+def is_cluster_eligible_role(raw_role: str):
+    return normalize_role(raw_role) in {'CEO', 'CFO', 'COO', 'Chairman'}
 
 
 def parse_trade_value(entry):
@@ -158,8 +168,6 @@ def _nt(text):
 
 
 def append_to_notion(row):
-    # row: [ticker, ctype, i1name, i1role, i1val, i2name, i2role, i2val,
-    #        date1, date2, combined, entry, exit_by, status, reason, detected]
     if not NOTION_TOKEN or not NOTION_DB_ID:
         print('  [Notion] NOTION_TOKEN or NOTION_DATABASE_ID not set — skipping')
         return False
@@ -353,7 +361,7 @@ def parse_xml(xml_text):
         name     = ft('rptOwnerName') or 'Unknown'
         cik      = ft('rptOwnerCik') or ft('issuerCik') or ''
         role_raw = ft('officerTitle') or ft('otherText') or ''
-        company   = ft('issuerName') or ''
+        company  = ft('issuerName') or ''
         amended  = (ft('documentType') or '').endswith('/A')
         fd       = date.today()
         p        = ft('periodOfReport')
@@ -365,8 +373,8 @@ def parse_xml(xml_text):
             code  = txn.find('.//transactionCode')
             sh    = txn.find('.//transactionShares/value')
             price = txn.find('.//transactionPricePerShare/value')
-            if code is None or code.text != 'P': continue
-            if sh is None or price is None: continue
+            if code is None or code.text != 'P':
+                continue
             shares = safe_num(sh.text if sh is not None else None)
             px     = safe_num(price.text if price is not None else None)
             if shares is None or px is None:
@@ -402,11 +410,13 @@ def detect_clusters(filings):
     for ticker, rows in by_ticker.items():
         seen_ciks = {}
         for r in sorted(rows, key=lambda x: x['filing_date']):
-            if r['filing_date'] < cutoff: continue
+            if r['filing_date'] < cutoff:
+                continue
             if r['insider_cik'] not in seen_ciks:
                 seen_ciks[r['insider_cik']] = r
         unique = sorted(seen_ciks.values(), key=lambda x: x['filing_date'])
-        if len(unique) < 2: continue
+        if len(unique) < 2:
+            continue
         i1, i2 = unique[0], unique[1]
         ctype  = 'A' if i1['filing_date'] == i2['filing_date'] else 'B'
         entry  = next_trading_day(i2['filing_date'])
