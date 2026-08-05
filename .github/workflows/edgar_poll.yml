@@ -31,4 +31,4 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           TEST_MODE: ${{ secrets.TEST_MODE }}
-        run: python edgar_poll.py
+        run: python src/edgar_poll.py
