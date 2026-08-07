@@ -1,0 +1,19 @@
+name: One-Time Backfill
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install requests lxml
+      - name: Run backfill
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_FILINGS_DB_ID: ${{ secrets.NOTION_FILINGS_DB_ID }}
+        run: python backfill.py --days 10 --fix-existing
