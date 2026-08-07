@@ -4,6 +4,17 @@ insider_bot.py
 Single-file insider cluster signal bot.
 Logs to Notion. Alerts via Telegram.
 
+Persistence fix (Aug 2026): cluster detection previously only compared
+filings fetched within the same run's 3-day EDGAR window, so two
+qualifying filings whose SEC *filing dates* were more than 3 days apart
+(even if trade dates were close) were never seen together and clusters
+were silently missed (e.g. ACI: Morris filed 7/30, McCollam filed 8/3 —
+8 days apart, well outside the old 3-day fetch window, but both well
+inside CLUSTER_DAYS=14). Every qualifying filing is now persisted to a
+second Notion database ("Insider Filings Log") and each run rebuilds
+the full CLUSTER_DAYS window from that store before clustering, so
+filings from prior runs are always considered.
+
 To run a smoke test via GitHub Actions:
   Set secret TEST_MODE = 1 in GitHub Secrets, trigger workflow manually.
   Remove TEST_MODE secret when going live.
@@ -16,11 +27,12 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
-NOTION_TOKEN     = os.environ.get('NOTION_TOKEN', '')
-NOTION_DB_ID     = os.environ.get('NOTION_DATABASE_ID', '')
-TEST_MODE        = os.environ.get('TEST_MODE', '0') == '1'
+TELEGRAM_TOKEN       = os.environ.get('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID     = os.environ.get('TELEGRAM_CHAT_ID', '')
+NOTION_TOKEN         = os.environ.get('NOTION_TOKEN', '')
+NOTION_DB_ID         = os.environ.get('NOTION_DATABASE_ID', '')
+NOTION_FILINGS_DB_ID = os.environ.get('NOTION_FILINGS_DB_ID', '')  # NEW: "Insider Filings Log"
+TEST_MODE            = os.environ.get('TEST_MODE', '0') == '1'
 
 MIN_PURCHASE   = 50_000
 MIN_MARKET_CAP = 500_000_000
@@ -243,6 +255,139 @@ def load_seen():
     return seen
 
 
+# ── NOTION: FILINGS LOG (persistent 14-day filing history) ────────────────
+# This is the fix for the missed-cluster bug: raw qualifying filings are
+# written here as they're discovered, and every run re-reads the full
+# CLUSTER_DAYS window from this store (not just the current 3-day EDGAR
+# fetch) before running detect_clusters().
+
+def append_filing_to_notion(entry):
+    """Persist one qualifying filing. Returns True on success."""
+    if not NOTION_TOKEN or not NOTION_FILINGS_DB_ID:
+        print('  [Notion/Filings] NOTION_FILINGS_DB_ID not set — skipping persistence')
+        return False
+    props = {
+        'Ticker':          _nt(entry['ticker']),
+        'InsiderCik':      _np(entry.get('insider_cik', '')),
+        'InsiderName':     _np(entry.get('insider_name', '')),
+        'Role':            _np(entry.get('insider_role', '')),
+        'Value':           _np('{:.2f}'.format(entry.get('value') or 0)),
+        'FilingDate':      _np(str(entry.get('filing_date', ''))),
+        'TransactionCode': _np(entry.get('transaction_code', 'P')),
+        'Company':         _np(entry.get('company', '')),
+        'Detected':        _np(datetime.now(timezone.utc).isoformat()),
+        'AccessionKey':    _np(entry.get('accession', '')),
+    }
+    try:
+        resp = requests.post(
+            'https://api.notion.com/v1/pages',
+            headers=NOTION_HDRS,
+            json={'parent': {'database_id': NOTION_FILINGS_DB_ID}, 'properties': props},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            return True
+        print('  [Notion/Filings] failed ' + str(resp.status_code) + ': ' + resp.text[:300])
+        return False
+    except Exception as e:
+        print('  [Notion/Filings] exception: ' + str(e))
+        return False
+
+
+def load_logged_accessions():
+    """Return set of AccessionKey values already persisted, to avoid duplicate
+    writes across runs (fetch_entries re-scans the last few days every run)."""
+    if not NOTION_TOKEN or not NOTION_FILINGS_DB_ID:
+        return set()
+    seen = set()
+    try:
+        cursor = None
+        while True:
+            body = {'page_size': 100}
+            if cursor:
+                body['start_cursor'] = cursor
+            resp = requests.post(
+                'https://api.notion.com/v1/databases/' + NOTION_FILINGS_DB_ID + '/query',
+                headers=NOTION_HDRS, json=body, timeout=10
+            )
+            if resp.status_code != 200:
+                print('  [Notion/Filings] load_logged_accessions failed: ' + resp.text[:200])
+                break
+            data = resp.json()
+            for page in data.get('results', []):
+                props = page.get('properties', {})
+                rt = props.get('AccessionKey', {}).get('rich_text', [])
+                acc = rt[0]['text']['content'] if rt else ''
+                if acc:
+                    seen.add(acc)
+            if not data.get('has_more'):
+                break
+            cursor = data.get('next_cursor')
+    except Exception as e:
+        print('  [Notion/Filings] load_logged_accessions exception: ' + str(e))
+    return seen
+
+
+def load_recent_filings(days=CLUSTER_DAYS):
+    """Load all persisted filings within the last `days` days, reconstructed
+    into the same dict shape parse_xml() produces, so they can be merged
+    with freshly-parsed filings before clustering."""
+    if not NOTION_TOKEN or not NOTION_FILINGS_DB_ID:
+        return []
+    cutoff = date.today() - timedelta(days=days)
+    out = []
+    try:
+        cursor = None
+        while True:
+            body = {'page_size': 100}
+            if cursor:
+                body['start_cursor'] = cursor
+            resp = requests.post(
+                'https://api.notion.com/v1/databases/' + NOTION_FILINGS_DB_ID + '/query',
+                headers=NOTION_HDRS, json=body, timeout=10
+            )
+            if resp.status_code != 200:
+                print('  [Notion/Filings] load_recent_filings failed: ' + resp.text[:200])
+                break
+            data = resp.json()
+            for page in data.get('results', []):
+                props = page.get('properties', {})
+                def gp(k):
+                    rt = props.get(k, {}).get('rich_text', [])
+                    return rt[0]['text']['content'] if rt else ''
+                title_arr = props.get('Ticker', {}).get('title', [])
+                ticker = title_arr[0]['text']['content'] if title_arr else ''
+                fd_raw = gp('FilingDate')
+                try:
+                    fd = date.fromisoformat(fd_raw) if fd_raw else None
+                except ValueError:
+                    fd = None
+                if not ticker or fd is None or fd < cutoff:
+                    continue
+                out.append({
+                    'ticker': ticker,
+                    'insider_name': gp('InsiderName'),
+                    'insider_cik': gp('InsiderCik'),
+                    'insider_role': gp('Role'),
+                    'value': safe_num(gp('Value')) or 0.0,
+                    'filing_date': fd,
+                    'amended': False,
+                    'role_raw': gp('Role'),
+                    'stock_price': None,
+                    'shares': None,
+                    'transaction_code': gp('TransactionCode') or 'P',
+                    'company': gp('Company'),
+                    'accession': gp('AccessionKey'),
+                })
+            if not data.get('has_more'):
+                break
+            cursor = data.get('next_cursor')
+    except Exception as e:
+        print('  [Notion/Filings] load_recent_filings exception: ' + str(e))
+    print('  [Notion/Filings] loaded ' + str(len(out)) + ' filings from last ' + str(days) + ' days')
+    return out
+
+
 # ── PRICE CHECKS ──────────────────────────────────────────────────────────
 
 def get_market_cap(ticker):
@@ -301,7 +446,9 @@ def fetch_entries(days_back=1):
                     seen.add(acc)
                     cik = ciks[0].lstrip('0')
                     nd  = acc.replace('-', '')
-                    results.append({'index_url':
+                    results.append({
+                        'accession': acc,  # NEW: carried through for filings-log dedup
+                        'index_url':
                         'https://www.sec.gov/Archives/edgar/data/' + cik +
                         '/' + nd + '/' + acc + '-index.htm'})
                 if len(results) >= total:
@@ -345,7 +492,7 @@ def fetch_xml(index_url):
     return None, None
 
 
-def parse_xml(xml_text):
+def parse_xml(xml_text, accession=''):
     results = []
     try:
         root = etree.fromstring(xml_text.encode(),
@@ -390,7 +537,8 @@ def parse_xml(xml_text):
                 'insider_cik': cik, 'insider_role': role,
                 'value': value, 'filing_date': fd, 'amended': amended,
                 'role_raw': role_raw, 'stock_price': px, 'shares': shares,
-                'transaction_code': 'P', 'company': company
+                'transaction_code': 'P', 'company': company,
+                'accession': accession,  # NEW: carried through for filings-log dedup
             })
     except Exception as e:
         print('parse_xml error: ' + str(e))
@@ -524,14 +672,41 @@ def main():
         if not xml_text:
             no_xml += 1
             continue
-        parsed = parse_xml(xml_text)
+        parsed = parse_xml(xml_text, accession=e.get('accession', ''))
         if not parsed:
             skipped += 1
             continue
         all_filings.extend(parsed)
 
-    print('Qualifying P-transactions: ' + str(len(all_filings)))
-    signals = detect_clusters(all_filings)
+    print('Qualifying P-transactions (this run): ' + str(len(all_filings)))
+
+    # ── PERSIST new filings to the Insider Filings Log, then rebuild the
+    # full CLUSTER_DAYS window from that store so clusters spanning filings
+    # from earlier runs are no longer missed. ──
+    already_logged = load_logged_accessions()
+    newly_logged = 0
+    for f in all_filings:
+        acc = f.get('accession', '')
+        if acc and acc in already_logged:
+            continue
+        if append_filing_to_notion(f):
+            newly_logged += 1
+            if acc:
+                already_logged.add(acc)
+    print('New filings persisted to Notion filings log: ' + str(newly_logged))
+
+    historical = load_recent_filings(days=CLUSTER_DAYS)
+
+    # Merge, de-duplicating by accession (fall back to ticker+cik+filing_date
+    # if accession missing, e.g. for legacy rows).
+    merged = {}
+    for f in historical + all_filings:
+        key = f.get('accession') or (f['ticker'] + '|' + f['insider_cik'] + '|' + str(f['filing_date']))
+        merged[key] = f
+    combined_filings = list(merged.values())
+    print('Combined filings for clustering (last ' + str(CLUSTER_DAYS) + ' days): ' + str(len(combined_filings)))
+
+    signals = detect_clusters(combined_filings)
     print('Clusters detected: ' + str(len(signals)))
 
     if not signals:
