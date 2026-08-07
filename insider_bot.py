@@ -5,15 +5,22 @@ Single-file insider cluster signal bot.
 Logs to Notion. Alerts via Telegram.
 
 Persistence fix (Aug 2026): cluster detection previously only compared
-filings fetched within the same run's 3-day EDGAR window, so two
-qualifying filings whose SEC *filing dates* were more than 3 days apart
+filings fetched within the same run's fetch window, so two qualifying
+filings whose SEC *filing dates* were further apart than that window
 (even if trade dates were close) were never seen together and clusters
 were silently missed (e.g. ACI: Morris filed 7/30, McCollam filed 8/3 —
-8 days apart, well outside the old 3-day fetch window, but both well
-inside CLUSTER_DAYS=14). Every qualifying filing is now persisted to a
-second Notion database ("Insider Filings Log") and each run rebuilds
-the full CLUSTER_DAYS window from that store before clustering, so
-filings from prior runs are always considered.
+4 days apart, right at the edge of the old 3-day fetch window, but both
+well inside CLUSTER_DAYS=14). Every qualifying filing is now persisted
+to a second Notion database ("Insider Filings Log") and each run
+rebuilds the full CLUSTER_DAYS window from that store before
+clustering, so filings from prior runs are always considered.
+
+Window fix (Aug 2026): fetch_entries() window widened from days_back=3
+to days_back=7. SEC filers can lag several business days between trade
+date and filing date, and weekends/holidays compress the calendar
+window further — 3 days left the bot exposed to silently dropping
+filings that never entered the persistent store at all. 7 days gives
+comfortable buffer while still being cheap to query/parse each run.
 
 To run a smoke test via GitHub Actions:
   Set secret TEST_MODE = 1 in GitHub Secrets, trigger workflow manually.
@@ -31,7 +38,7 @@ TELEGRAM_TOKEN       = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID     = os.environ.get('TELEGRAM_CHAT_ID', '')
 NOTION_TOKEN         = os.environ.get('NOTION_TOKEN', '')
 NOTION_DB_ID         = os.environ.get('NOTION_DATABASE_ID', '')
-NOTION_FILINGS_DB_ID = os.environ.get('NOTION_FILINGS_DB_ID', '')  # NEW: "Insider Filings Log"
+NOTION_FILINGS_DB_ID = os.environ.get('NOTION_FILINGS_DB_ID', '')  # "Insider Filings Log"
 TEST_MODE            = os.environ.get('TEST_MODE', '0') == '1'
 
 MIN_PURCHASE   = 50_000
@@ -39,6 +46,7 @@ MIN_MARKET_CAP = 500_000_000
 MAX_GAP_PCT    = 0.03
 CLUSTER_DAYS   = 14
 HOLD_DAYS      = 5
+FETCH_DAYS_BACK = 7  # widened from 3 -> 7 to absorb SEC filing lag / weekends / holidays
 HEADERS        = {'User-Agent': 'InsiderClusterBot admin@example.com'}
 EFTS_URL       = 'https://efts.sec.gov/LATEST/search-index'
 NOTION_HDRS    = {
@@ -258,8 +266,8 @@ def load_seen():
 # ── NOTION: FILINGS LOG (persistent 14-day filing history) ────────────────
 # This is the fix for the missed-cluster bug: raw qualifying filings are
 # written here as they're discovered, and every run re-reads the full
-# CLUSTER_DAYS window from this store (not just the current 3-day EDGAR
-# fetch) before running detect_clusters().
+# CLUSTER_DAYS window from this store (not just the current fetch window)
+# before running detect_clusters().
 
 def append_filing_to_notion(entry):
     """Persist one qualifying filing. Returns True on success."""
@@ -296,7 +304,7 @@ def append_filing_to_notion(entry):
 
 def load_logged_accessions():
     """Return set of AccessionKey values already persisted, to avoid duplicate
-    writes across runs (fetch_entries re-scans the last few days every run)."""
+    writes across runs (fetch_entries re-scans overlapping days every run)."""
     if not NOTION_TOKEN or not NOTION_FILINGS_DB_ID:
         return set()
     seen = set()
@@ -414,7 +422,7 @@ def get_gap_pct(ticker):
 
 # ── EDGAR ─────────────────────────────────────────────────────────────────
 
-def fetch_entries(days_back=1):
+def fetch_entries(days_back=FETCH_DAYS_BACK):
     today  = date.today().isoformat()
     start  = (date.today() - timedelta(days=days_back)).isoformat()
     results, seen = [], set()
@@ -447,7 +455,7 @@ def fetch_entries(days_back=1):
                     cik = ciks[0].lstrip('0')
                     nd  = acc.replace('-', '')
                     results.append({
-                        'accession': acc,  # NEW: carried through for filings-log dedup
+                        'accession': acc,
                         'index_url':
                         'https://www.sec.gov/Archives/edgar/data/' + cik +
                         '/' + nd + '/' + acc + '-index.htm'})
@@ -538,7 +546,7 @@ def parse_xml(xml_text, accession=''):
                 'value': value, 'filing_date': fd, 'amended': amended,
                 'role_raw': role_raw, 'stock_price': px, 'shares': shares,
                 'transaction_code': 'P', 'company': company,
-                'accession': accession,  # NEW: carried through for filings-log dedup
+                'accession': accession,
             })
     except Exception as e:
         print('parse_xml error: ' + str(e))
@@ -664,7 +672,7 @@ def run_smoke_test():
 def main():
     print('=== insider_bot started ' + datetime.now(timezone.utc).isoformat() + ' ===')
 
-    entries = fetch_entries(days_back=3)
+    entries = fetch_entries(days_back=FETCH_DAYS_BACK)
     all_filings, no_xml, skipped = [], 0, 0
 
     for e in entries:
