@@ -22,6 +22,16 @@ window further — 3 days left the bot exposed to silently dropping
 filings that never entered the persistent store at all. 7 days gives
 comfortable buffer while still being cheap to query/parse each run.
 
+Pagination fix (Aug 2026): fetch_entries() previously hard-capped at 6
+EFTS result pages (600 filings). SEC returns ~500-600 Form 4s PER DAY,
+so a 7-day window can produce several thousand results -- the old cap
+silently truncated the scan and dropped filings that never even made
+it into the "seen" set, regardless of date, role, or value (e.g. REFI:
+Mazarakis + Cappell filed 8/19, never persisted, because the 6-page cap
+was hit before the scan reached them). The page budget is now much
+larger and, if the cap is still hit, main() prints a loud WARNING
+instead of silently declaring the scan complete.
+
 To run a smoke test via GitHub Actions:
   Set secret TEST_MODE = 1 in GitHub Secrets, trigger workflow manually.
   Remove TEST_MODE secret when going live.
@@ -33,7 +43,7 @@ from datetime import date, datetime, timedelta, timezone
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
-# ── CONFIG ────────────────────────────────────────────────────────────────
+# ── CONFIG ────────────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN       = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID     = os.environ.get('TELEGRAM_CHAT_ID', '')
 NOTION_TOKEN         = os.environ.get('NOTION_TOKEN', '')
@@ -47,6 +57,7 @@ MAX_GAP_PCT    = 0.03
 CLUSTER_DAYS   = 14
 HOLD_DAYS      = 5
 FETCH_DAYS_BACK = 7  # widened from 3 -> 7 to absorb SEC filing lag / weekends / holidays
+MAX_EFTS_PAGES = 60  # widened from 6 -> 60 (6,000 filings) to stop silent truncation
 HEADERS        = {'User-Agent': 'InsiderClusterBot admin@example.com'}
 EFTS_URL       = 'https://efts.sec.gov/LATEST/search-index'
 NOTION_HDRS    = {
@@ -79,7 +90,7 @@ NYSE_HOLIDAYS = {
 }
 
 
-# ── HELPERS ───────────────────────────────────────────────────────────────
+# ── HELPERS ────────────────────────────────────────────────────────────────────────────
 
 def safe_num(x, default=None):
     if x is None:
@@ -157,7 +168,7 @@ def next_trading_day(d):
     return d
 
 
-# ── TELEGRAM ──────────────────────────────────────────────────────────────
+# ── TELEGRAM ────────────────────────────────────────────────────────────────────────────
 
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -178,7 +189,7 @@ def send_telegram(text):
         print('  [TG] exception: ' + str(e))
 
 
-# ── NOTION ────────────────────────────────────────────────────────────────
+# ── NOTION ────────────────────────────────────────────────────────────────────────────
 
 def _np(text):
     return {'rich_text': [{'text': {'content': str(text)}}]}
@@ -263,7 +274,7 @@ def load_seen():
     return seen
 
 
-# ── NOTION: FILINGS LOG (persistent 14-day filing history) ────────────────
+# ── NOTION: FILINGS LOG (persistent 14-day filing history) ──────────────
 # This is the fix for the missed-cluster bug: raw qualifying filings are
 # written here as they're discovered, and every run re-reads the full
 # CLUSTER_DAYS window from this store (not just the current fetch window)
@@ -396,7 +407,7 @@ def load_recent_filings(days=CLUSTER_DAYS):
     return out
 
 
-# ── PRICE CHECKS ──────────────────────────────────────────────────────────
+# ── PRICE CHECKS ─────────────────────────────────────────────────────────────────────
 
 def get_market_cap(ticker):
     try:
@@ -420,13 +431,14 @@ def get_gap_pct(ticker):
         return None
 
 
-# ── EDGAR ─────────────────────────────────────────────────────────────────
+# ── EDGAR ────────────────────────────────────────────────────────────────────────────
 
 def fetch_entries(days_back=FETCH_DAYS_BACK):
     today  = date.today().isoformat()
     start  = (date.today() - timedelta(days=days_back)).isoformat()
     results, seen = [], set()
-    for page in range(6):
+    truncated = False
+    for page in range(MAX_EFTS_PAGES):
         success = False
         last_err = None
         for attempt in range(3):
@@ -462,6 +474,8 @@ def fetch_entries(days_back=FETCH_DAYS_BACK):
                 if len(results) >= total:
                     success = True
                     break
+                if page == MAX_EFTS_PAGES - 1:
+                    truncated = True
                 time.sleep(0.1)
                 success = True
                 break
@@ -474,6 +488,10 @@ def fetch_entries(days_back=FETCH_DAYS_BACK):
             print('fetch_entries page ' + str(page) + ' failed after retries: ' + str(last_err))
             continue
     print('Entries fetched: ' + str(len(results)))
+    if truncated:
+        print('WARNING: fetch_entries hit MAX_EFTS_PAGES=' + str(MAX_EFTS_PAGES)
+              + ' (' + str(MAX_EFTS_PAGES * 100) + ' results) — scan may be INCOMPLETE. '
+              + 'Consider narrowing FETCH_DAYS_BACK or raising MAX_EFTS_PAGES further.')
     return results
 
 
@@ -524,6 +542,10 @@ def parse_xml(xml_text, accession=''):
             try: fd = date.fromisoformat(p)
             except ValueError: pass
 
+        total_shares = 0.0
+        total_value  = 0.0
+        found_any    = False
+
         for txn in root.findall('.//nonDerivativeTransaction'):
             code  = txn.find('.//transactionCode')
             sh    = txn.find('.//transactionShares/value')
@@ -534,26 +556,32 @@ def parse_xml(xml_text, accession=''):
             px     = safe_num(price.text if price is not None else None)
             if shares is None or px is None:
                 continue
-            value = shares * px
-            if value < MIN_PURCHASE:
-                continue
-            role = classify_role(role_raw, company)
-            if role == 'Other':
-                continue
-            results.append({
-                'ticker': ticker, 'insider_name': name,
-                'insider_cik': cik, 'insider_role': role,
-                'value': value, 'filing_date': fd, 'amended': amended,
-                'role_raw': role_raw, 'stock_price': px, 'shares': shares,
-                'transaction_code': 'P', 'company': company,
-                'accession': accession,
-            })
+            total_shares += shares
+            total_value  += shares * px
+            found_any = True
+
+        if not found_any or total_value < MIN_PURCHASE:
+            return []
+
+        role = classify_role(role_raw, company)
+        if role == 'Other':
+            return []
+
+        results.append({
+            'ticker': ticker, 'insider_name': name,
+            'insider_cik': cik, 'insider_role': role,
+            'value': total_value, 'filing_date': fd, 'amended': amended,
+            'role_raw': role_raw, 'stock_price': (total_value / total_shares) if total_shares else None,
+            'shares': total_shares,
+            'transaction_code': 'P', 'company': company,
+            'accession': accession,
+        })
     except Exception as e:
         print('parse_xml error: ' + str(e))
     return results
 
 
-# ── CLUSTER DETECTION ─────────────────────────────────────────────────────
+# ── CLUSTER DETECTION ────────────────────────────────────────────────────────
 
 def detect_clusters(filings):
     by_ticker = defaultdict(list)
@@ -595,7 +623,7 @@ def detect_clusters(filings):
     return signals
 
 
-# ── FILTERS ───────────────────────────────────────────────────────────────
+# ── FILTERS ────────────────────────────────────────────────────────────────────────────
 
 def apply_filters(s):
     mcap = get_market_cap(s['ticker'])
@@ -608,7 +636,7 @@ def apply_filters(s):
     return True, ''
 
 
-# ── FORMAT ALERT ──────────────────────────────────────────────────────────
+# ── FORMAT ALERT ────────────────────────────────────────────────────────────────────────
 
 def format_alert(s):
     nl = chr(10)
@@ -637,7 +665,7 @@ def make_row(s, status, reason):
     ]
 
 
-# ── SMOKE TEST ────────────────────────────────────────────────────────────
+# ── SMOKE TEST ─────────────────────────────────────────────────────────────────────────
 
 def run_smoke_test():
     print('=== SMOKE TEST MODE ===')
@@ -667,7 +695,7 @@ def run_smoke_test():
         print('=== SMOKE TEST FAILED: Notion write failed — check secrets ===')
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────────
+# ── MAIN ────────────────────────────────────────────────────────────────────────────
 
 def main():
     print('=== insider_bot started ' + datetime.now(timezone.utc).isoformat() + ' ===')
