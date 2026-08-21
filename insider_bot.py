@@ -32,6 +32,13 @@ was hit before the scan reached them). The page budget is now much
 larger and, if the cap is still hit, main() prints a loud WARNING
 instead of silently declaring the scan complete.
 
+Reliability fix (Aug 2026): fetch_entries() retry budget raised from 3
+to 5 attempts per page with longer backoff, permanently-failed pages
+are now tracked explicitly and summarized in a loud WARNING (instead of
+silently blending into the entries count), and a small delay is added
+between every page request (success or fail) to ease SEC-side rate
+limiting / transient 500 errors during large multi-page scans.
+
 To run a smoke test via GitHub Actions:
   Set secret TEST_MODE = 1 in GitHub Secrets, trigger workflow manually.
   Remove TEST_MODE secret when going live.
@@ -438,10 +445,11 @@ def fetch_entries(days_back=FETCH_DAYS_BACK):
     start  = (date.today() - timedelta(days=days_back)).isoformat()
     results, seen = [], set()
     truncated = False
+    failed_pages = []
     for page in range(MAX_EFTS_PAGES):
         success = False
         last_err = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 r = requests.get(EFTS_URL, headers=HEADERS, timeout=20, params={
                     'q': '""', 'dateRange': 'custom',
@@ -476,22 +484,26 @@ def fetch_entries(days_back=FETCH_DAYS_BACK):
                     break
                 if page == MAX_EFTS_PAGES - 1:
                     truncated = True
-                time.sleep(0.1)
                 success = True
                 break
             except Exception as e:
                 last_err = e
-                wait = 1.5 * (2 ** attempt)
+                wait = 2 * (2 ** attempt)
                 print('fetch_entries page ' + str(page) + ' attempt ' + str(attempt + 1) + ' error: ' + str(e) + ' — retry in ' + str(wait) + 's')
                 time.sleep(wait)
         if not success:
-            print('fetch_entries page ' + str(page) + ' failed after retries: ' + str(last_err))
-            continue
+            failed_pages.append(page)
+            print('fetch_entries page ' + str(page) + ' PERMANENTLY FAILED after 5 retries: ' + str(last_err))
+        time.sleep(0.15)  # small delay between every page request, success or fail, to ease SEC rate limiting
     print('Entries fetched: ' + str(len(results)))
     if truncated:
         print('WARNING: fetch_entries hit MAX_EFTS_PAGES=' + str(MAX_EFTS_PAGES)
               + ' (' + str(MAX_EFTS_PAGES * 100) + ' results) — scan may be INCOMPLETE. '
               + 'Consider narrowing FETCH_DAYS_BACK or raising MAX_EFTS_PAGES further.')
+    if failed_pages:
+        print('WARNING: ' + str(len(failed_pages)) + ' page(s) permanently failed after 5 retries: '
+              + str(failed_pages) + ' — approximately ' + str(len(failed_pages) * 100)
+              + ' filings may be MISSING from this run. Consider re-running.')
     return results
 
 
