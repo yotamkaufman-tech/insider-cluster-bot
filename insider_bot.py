@@ -39,6 +39,18 @@ silently blending into the entries count), and a small delay is added
 between every page request (success or fail) to ease SEC-side rate
 limiting / transient 500 errors during large multi-page scans.
 
+Role-scope fix (Aug 2026): classify_role() previously only recognized
+CEO/CFO/COO/Chairman keywords, so any other "Chief X Officer" title
+(Chief Strategy Officer, Chief Technology Officer, Chief Marketing
+Officer, Chief Accounting Officer, Chief Legal Officer, Chief Revenue
+Officer, etc.) was silently classified as 'Other' and excluded from
+clustering entirely -- even when paired with another qualifying C-suite
+purchase (e.g. BTDR: CFO Potter 8/12 + Chief Strategy Officer Basit
+8/14, a legitimate Type-B cluster that never formed because Basit's
+title didn't match any keyword). Any title containing "chief" that
+doesn't already match CEO/CFO/COO/Chairman now qualifies as a generic
+'Chief Officer' role, which is eligible for clustering.
+
 To run a smoke test via GitHub Actions:
   Set secret TEST_MODE = 1 in GitHub Secrets, trigger workflow manually.
   Remove TEST_MODE secret when going live.
@@ -50,7 +62,7 @@ from datetime import date, datetime, timedelta, timezone
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────────────
+# ── CONFIG ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN       = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID     = os.environ.get('TELEGRAM_CHAT_ID', '')
 NOTION_TOKEN         = os.environ.get('NOTION_TOKEN', '')
@@ -97,7 +109,7 @@ NYSE_HOLIDAYS = {
 }
 
 
-# ── HELPERS ────────────────────────────────────────────────────────────────────────────
+# ── HELPERS ───────────────────────────────────────────────────────────────
 
 def safe_num(x, default=None):
     if x is None:
@@ -124,6 +136,16 @@ def classify_role(raw, company=''):
             return 'Other C-Level'
         if any(p in c for p in ['petroleum', 'energy', 'exploration', 'oil', 'gas']):
             return 'Other C-Level'
+    # Chief-officer catch-all (Aug 2026): any title containing "chief" that
+    # didn't already match CEO/CFO/COO/Chairman above now qualifies as a
+    # generic Chief Officer, e.g. Chief Strategy Officer, Chief Technology
+    # Officer, Chief Marketing Officer, Chief Accounting Officer, Chief
+    # Legal Officer, Chief Revenue Officer, etc. This was added after BTDR's
+    # Chief Strategy Officer purchase (Basit, 8/14) was correctly excluded
+    # under the old CEO/CFO/COO/Chairman-only rule, which prevented a
+    # legitimate cluster with the CFO's 8/12 purchase from being detected.
+    if 'chief' in t:
+        return 'Chief Officer'
     return 'Other'
 
 
@@ -132,7 +154,7 @@ def normalize_role(raw_role: str):
 
 
 def is_cluster_eligible_role(raw_role: str):
-    return normalize_role(raw_role) in {'CEO', 'CFO', 'COO', 'Chairman'}
+    return normalize_role(raw_role) in {'CEO', 'CFO', 'COO', 'Chairman', 'Chief Officer'}
 
 
 def parse_trade_value(entry):
@@ -175,7 +197,7 @@ def next_trading_day(d):
     return d
 
 
-# ── TELEGRAM ────────────────────────────────────────────────────────────────────────────
+# ── TELEGRAM ──────────────────────────────────────────────────────────────
 
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -196,7 +218,7 @@ def send_telegram(text):
         print('  [TG] exception: ' + str(e))
 
 
-# ── NOTION ────────────────────────────────────────────────────────────────────────────
+# ── NOTION ────────────────────────────────────────────────────────────────
 
 def _np(text):
     return {'rich_text': [{'text': {'content': str(text)}}]}
@@ -281,7 +303,7 @@ def load_seen():
     return seen
 
 
-# ── NOTION: FILINGS LOG (persistent 14-day filing history) ──────────────
+# ── NOTION: FILINGS LOG (persistent 14-day filing history) ────────────────
 # This is the fix for the missed-cluster bug: raw qualifying filings are
 # written here as they're discovered, and every run re-reads the full
 # CLUSTER_DAYS window from this store (not just the current fetch window)
@@ -414,7 +436,7 @@ def load_recent_filings(days=CLUSTER_DAYS):
     return out
 
 
-# ── PRICE CHECKS ─────────────────────────────────────────────────────────────────────
+# ── PRICE CHECKS ──────────────────────────────────────────────────────────
 
 def get_market_cap(ticker):
     try:
@@ -438,7 +460,7 @@ def get_gap_pct(ticker):
         return None
 
 
-# ── EDGAR ────────────────────────────────────────────────────────────────────────────
+# ── EDGAR ─────────────────────────────────────────────────────────────────
 
 def fetch_entries(days_back=FETCH_DAYS_BACK):
     today  = date.today().isoformat()
@@ -593,7 +615,7 @@ def parse_xml(xml_text, accession=''):
     return results
 
 
-# ── CLUSTER DETECTION ────────────────────────────────────────────────────────
+# ── CLUSTER DETECTION ─────────────────────────────────────────────────────
 
 def detect_clusters(filings):
     by_ticker = defaultdict(list)
@@ -635,7 +657,7 @@ def detect_clusters(filings):
     return signals
 
 
-# ── FILTERS ────────────────────────────────────────────────────────────────────────────
+# ── FILTERS ───────────────────────────────────────────────────────────────
 
 def apply_filters(s):
     mcap = get_market_cap(s['ticker'])
@@ -648,7 +670,7 @@ def apply_filters(s):
     return True, ''
 
 
-# ── FORMAT ALERT ────────────────────────────────────────────────────────────────────────
+# ── FORMAT ALERT ──────────────────────────────────────────────────────────
 
 def format_alert(s):
     nl = chr(10)
@@ -677,7 +699,7 @@ def make_row(s, status, reason):
     ]
 
 
-# ── SMOKE TEST ─────────────────────────────────────────────────────────────────────────
+# ── SMOKE TEST ────────────────────────────────────────────────────────────
 
 def run_smoke_test():
     print('=== SMOKE TEST MODE ===')
@@ -707,7 +729,7 @@ def run_smoke_test():
         print('=== SMOKE TEST FAILED: Notion write failed — check secrets ===')
 
 
-# ── MAIN ────────────────────────────────────────────────────────────────────────────
+# ── MAIN ──────────────────────────────────────────────────────────────────
 
 def main():
     print('=== insider_bot started ' + datetime.now(timezone.utc).isoformat() + ' ===')
